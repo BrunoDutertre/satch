@@ -4,10 +4,10 @@
 
 if [ -t 1 ]
 then
-  BOLD="\033[1m"
-  NORMAL="\033[0m"
-  RED="\033[1;31m"
-  GREEN="\033[1;32m"
+    BOLD=`tput bold`
+    NORMAL=`tput sgr0`
+    RED=`tput setaf 1`
+    GREEN=`tput setaf 2`
 fi
 
 die () {
