@@ -1,6 +1,4 @@
 /*------------------------------------------------------------------------*/
-//   Copyright (c) 2021, Armin Biere, Johannes Kepler University Linz     //
-/*------------------------------------------------------------------------*/
 
 // This is the library code of the SAT solver Satch with API in 'satch.h'.
 
@@ -66,7 +64,7 @@
 // scores are disabled with 'NVSIDS' too).  Including this file also
 // provides a consistent feature setting (of 'N...' macros).
 
-// If you want see which of these macros are actually defined use
+// If you want to see which of these macros are actually defined use
 // './configure -d' which in turn defines '-DIAGNOSE' and forces printing
 // those definitions and in particularly check out 'features/README.md'.
 
@@ -81,6 +79,43 @@
 #ifndef NSWITCH
 #define initial_focused_mode_conflicts 1e3
 #define initial_focused_mode_ticks     1e8
+#endif
+
+#ifndef NVIVIFICATION
+#define vivification_interval 1000 // Base elimination interval.
+#endif
+
+#ifndef NELIMINATION
+
+#ifndef NINPROCESSING
+#define elimination_interval	500	// Base elimination interval.
+#endif
+
+#ifndef NELIMINATIONLIMITS
+#ifndef NINPROCESSING
+#define elimination_ticks_fraction 0.2	// Ticks fraction in elimination.
+#endif
+#define elimination_occurrence_limit 1e3
+#define elimination_clause_size_limit 100
+#define elimination_rounds 2
+#endif
+#endif
+
+#ifndef NSUBSUMPTION
+
+#ifndef NINPROCESSING
+#define subsumption_ticks_fraction 0.1	// Ticks fraction in subsumption.
+#endif
+
+#ifndef NSUBSUMPTIONLIMITS
+#define subsumption_occurrence_limit 1e3
+#define subsumption_clause_size_limit 1e3
+#define subsumption_rounds 2
+#ifndef NSTRENGTHENING
+#define strengthening_occurrence_limit 1e3
+#endif
+#endif
+
 #endif
 
 #ifndef NSTABLE
@@ -112,13 +147,14 @@
 #define restart_margin          1.1	// Margin for fast_glue > slow_glue.
 #endif
 
-#ifndef NREASONS
+#ifndef NBUMPREASONS
 #define bump_reason_decision_rate_limit		10
 #endif
 
-// Increase factors (inverse of decay) for exponential VSIDS.
 
 #ifndef NVSIDS
+
+// Increase factors (inverse of decay) for exponential VSIDS.
 
 #ifndef NFOCUSED
 #define focused_score_increment_factor	1.15
@@ -128,8 +164,15 @@
 #define stable_score_increment_factor	1.05
 #endif
 
-#define MAX_SCORE		1e150	// Maximum score before rescore.
+#endif
 
+#ifndef NHEAP
+#define MAX_SCORE		1e150	// Maximum score before rescore.
+#endif
+
+
+#ifdef NCDCL
+#define DUMMY_REASON    (struct clause *)1 // Dummy constant (not 0).
 #endif
 
 /*------------------------------------------------------------------------*/
@@ -145,10 +188,11 @@
 #include "catch.h"		// Online proof checker for testing.
 #endif
 
-#ifndef NRSORT
+#ifndef NRADIXSORT
 #include "rsort.h"		// Generic radix sort implementation.
 #endif
 
+#include "qsort.h"		// Generic radix sort implementation.
 #include "stack.h"		// Generic stack implementation.
 #include "colors.h"		// Shared code for terminal colors.
 
@@ -160,10 +204,10 @@
 
 struct clause
 {
-#if !defined(NDEBUG) || defined(NRSORT)
+#if defined(LOGGING) || defined(NRADIXSORT)
 
   // From 'solver->statistics.added' needed for stable sorting if radix
-  // sorting is disable ('NRSORT' defined) and of course for logging.
+  // sorting is disabled ('NRADIXSORT' defined) and of course for logging.
 
   uint64_t id;
 #endif
@@ -174,6 +218,9 @@ struct clause
   bool garbage:1;		// Collect at next garbage collection.
   bool protected:1;		// Do not collect current reason clauses.
   bool redundant:1;		// Redundant / learned (not irredundant).
+#ifndef NSUBSUMPTION
+  bool subsumed:1;		// Already used in subsumption.
+#endif
 #ifndef NUSED
 #ifndef NTIER2
   unsigned used:2;		// Used since last clause reduction.
@@ -181,13 +228,24 @@ struct clause
   unsigned used:1;		// Used since last clause reduction.
 #endif
 #endif
+#ifndef NVIVIFICATION
+  bool shrunken:1;
+  unsigned vivify:2;
+#endif
+
+#ifdef NWATCHES
+ unsigned sum;			// Sum of non-false literals.
+ unsigned count;		// Number of non-false literals.
+#endif
 
 #ifndef NGLUE
   unsigned glue;		// Glucose level (LBD).
 #endif
+
 #ifndef NCACHE
   unsigned search;		// Cached replacement search position.
 #endif
+
   unsigned size;		// Size of clause (number of literals).
 
 #ifndef NVARIADIC
@@ -222,8 +280,8 @@ struct clauses
 // ('NBLOCK' undefined) the blocking literal and thus the header is
 // enough to watch a binary clause and the clause pointer can be omitted.
 
-// Actually, binary clauses can become completely 'virtual' and do have to
-// be stored at all outside of the watch lists  Thus in the default compact
+// Actually, binary clauses can become completely 'virtual' and do not have
+// to be stored at all outside of watch lists.  Thus in the default compact
 // compilation mode ('NVIRTUAL' undefined) we split watches into the two
 // parts 'binary' and 'clause' and then use a 'union' type for 'watch' in
 // order to be able to mix short watches for binary clauses (without clause
@@ -248,9 +306,7 @@ struct clauses
 struct header
 {
   bool binary;			// Binary clause.
-#ifndef NVIRTUAL
-  bool redundant;		// Relevant for statistics.
-#endif
+  bool redundant;		// Relevant for statistics and logging.
   unsigned blocking;		// Blocking literal of the clause.
 };
 
@@ -262,7 +318,25 @@ struct header
 
 #endif
 
-// The actual watch data structure.
+// The actual watch data structure (it is a 'union' - see discussion above).
+
+// For Java programmers not familiar with the 'union' concept in C (or
+// equivalently to variant records in Pascal) is the following explanation.
+
+// All members of a 'union' type overlap in memory and it depends on how you
+// access the 'union' (in our case as '.header' or '.clause') what data is
+// read (particularly if the fields have different length in bytes).  This
+// is completely unsafe though in general (breaks strong typing) and for
+// instance in Pascal could be used to implement type casts.  The user has
+// to make sure that the right data is accessed and this requires of course
+// some additional context.
+
+// In our case, without blocking literals ('NBLOCK' defined), the 'union'
+// just hides a clause pointer.  With blocking literals (keeping 'NBLOCK'
+// undefined) there are always one to two watches considered together on
+// watcher stacks.  The 'binary' field of the first one determines whether
+// the second one really exists (or is the start of another single or pair
+// of watches).  If 'binary' is false the second watch is a clause pointer.
 
 union watch
 {
@@ -287,13 +361,23 @@ struct watches
 // (i.e., which is not in 'features.h') in case the 'limits' structure
 // becomes empty and it does not need to be declared in the solver.  There
 // we can then only test 'NLIMITS'.  Note that, an empty 'struct' would
-// trigger an error during pedantic compilation ('./configure -p').
+      // trigger an error during pedantic compilation ('./configure -p').
 
+#ifdef NLIMITS
+#undef NLIMITS			// This is actually an option thus undefine it first.
+#endif
+
+#ifdef NELIMINATION
 #ifdef NREDUCE
 #ifdef NREPHASE
 #ifdef NRESTART
+#ifdef NSUBSUMPTION
 #ifdef NSWITCH
+#ifdef NVIVIFICATION
 #define NLIMITS
+#endif
+#endif
+#endif
 #endif
 #endif
 #endif
@@ -303,6 +387,40 @@ struct watches
 
 struct limits
 {
+#ifndef NELIMINATION
+  struct
+  {
+    uint64_t conflicts;		// Conflict-limit on elimination.
+    uint64_t fixed;		// Root-level fixed at elimination.
+    uint64_t marked;		// Marked as elimination candidates.
+#ifndef NELIMINATIONLIMITS
+    uint64_t ticks;		// Ticks limit for elimination.
+    uint64_t search;		// Saved search ticks at last elimination.
+#endif
+  } eliminate;
+#endif
+#ifndef NVIVIFICATION
+  struct {
+    uint64_t conflicts; // Conflict-limit on elimination.
+#ifndef NVIVIFICATIONLIMITS
+    uint64_t ticks;  // Ticks limit for elimination.
+    uint64_t search; // Saved search ticks at last elimination.
+#endif
+  } vivify;
+#endif
+#ifndef NREDUCE
+  struct
+  {
+    uint64_t conflicts;		// Conflict-limit on reducing.
+    uint64_t fixed;		// Root-level fixed at reduction.
+  } reduce;
+#endif
+#ifndef NREPHASE
+  uint64_t rephase;		// Conflict-limit on rephasing.
+#endif
+#ifndef NRESTART
+  uint64_t restart;		// Conflict-limit on restarting.
+#endif
 #ifndef NSWITCH
   struct
   {
@@ -314,21 +432,24 @@ struct limits
     } ticks;
   } mode;
 #endif
-#ifndef NREDUCE
+#ifndef NSUBSUMPTION
   struct
   {
-    uint64_t conflicts;		// Conflict-limit on reducing.
-    unsigned fixed;		// Root-level fixed at reduction.
-  } reduce;
+    uint64_t marked;		// Marked as subsume candidates.
+#ifndef NSUBSUMPTIONLIMITS
+    uint64_t ticks;		// Ticks limit for subsumption.
+    uint64_t search;		// Saved search ticks at last elimination.
 #endif
-#ifndef NREPHASE
-  uint64_t rephase;		// Conflict-limit on rephasing.
-#endif
-#ifndef NRESTART
-  uint64_t restart;		// Conflict-limit on restarting.
+  } subsume;
 #endif
 };
 
+#endif
+
+/*------------------------------------------------------------------------*/
+
+#if defined(NVIRTUAL) || defined(NELIMINATION)
+#define NBINARIES
 #endif
 
 /*------------------------------------------------------------------------*/
@@ -362,7 +483,7 @@ struct reluctant
 struct options
 {
   bool ascii;			// Use ASCII proof format.
-#ifndef NDEBUG
+#ifdef LOGGING
   bool logging;			// Print logging messages.
 #endif
   unsigned verbose;		// Verbose level for messages 0..4.
@@ -374,10 +495,9 @@ struct options
 
 struct statistics
 {
-#ifndef NACTIVE
+#ifndef NLAZYACTIVATION
   uint64_t activated[2];	// Activated variables (added queue/scores).
 #endif
-  unsigned active;		// Remaining active variables.
   uint64_t added;		// Number of added clauses.
 #ifndef NBEST
   uint64_t bests;		// Number of saved best trails.
@@ -390,15 +510,26 @@ struct statistics
   uint64_t deleted;		// Number of deleted clauses.
   uint64_t decisions;		// Total number of decisions.
   uint64_t deduced;		// Deduced literals (of 1st UIP clause).
-#ifdef NACTIVE
+#ifndef NELIMINATION
+  uint64_t eliminated;		// Number of eliminated variables.
+  uint64_t elimination_ticks;	// Number of elimination ticks.
+  uint64_t eliminations;	// Number of elimination phases.
+#endif
+#ifdef NLAZYACTIVATION
   uint64_t filled[2];		// Filled variables (added queue/scores).
 #endif
-  unsigned fixed;		// Root level assigned variables (units).
+  uint64_t fixed;		// Root level assigned variables (units).
 #ifndef NVSIDS
   uint64_t incremented;		// Bumped by incrementing score.
 #endif
   uint64_t irredundant;		// Current number of irredundant clauses.
   uint64_t learned;		// Learned literals (after minimization).
+#ifndef NELIMINATION
+  uint64_t marked_eliminate;	// Marked eliminate candidate variables.
+#endif
+#ifndef NSUBSUMPTION
+  uint64_t marked_subsume;	// Marked subsume candidate variables.
+#endif
 #ifndef NMINIMIZE
   uint64_t minimized;		// Minimized literals.
 #endif
@@ -406,14 +537,18 @@ struct statistics
   uint64_t moved;		// Bumped by moving to front.
 #endif
   uint64_t propagations;	// Propagated literals.
-#ifndef NREASONS
+#ifndef NBUMPREASONS
   uint64_t reasons;		// Additionally bumped reason side literals.
+#endif
+#ifndef NELIMINATION
+  uint64_t resolutions;		// Number of resolutions.
 #endif
 #ifndef NREDUCE
   uint64_t reduced;		// Number of reduced clauses.
   uint64_t reductions;		// Number of reductions (not clauses).
 #endif
   uint64_t redundant;		// Current number of redundant clauses.
+  uint64_t remaining;		// Remaining active variables.
 #ifndef NREPHASE
   uint64_t rephased;		// How often saved phases have been reset.
 #endif
@@ -431,14 +566,43 @@ struct statistics
   uint64_t reused;		// Number of reused trails.
 #endif
   uint64_t sections;		// Number of calls to 'section'.
+#ifndef NSHRINK
+  uint64_t shrunken;		// Shrunken literals.
+#endif
   uint64_t solved;		// Number of calls to 'satch_solve'.
+#ifndef NSUBSUMPTION
+  uint64_t strengthened;	// Strengthened clauses.
+  uint64_t subsumption_ticks;	// Number of subsumption ticks.
+  uint64_t subsumptions;	// Full backward subsumptions.
+#endif
+#if !defined (NSUBSUMPTION) || !defined (NVIVIFICATION)
+  uint64_t subsumed;            // Subsumed clauses.
+#endif
 #ifndef NSWITCH
   uint64_t switched;		// Number of focused/stable mode switches.
 #endif
 #ifndef NTARGET
   uint64_t targets;		// Number of saved target trails.
 #endif
+#ifndef NCHRONO
+  uint64_t chrono;              // Number of chronological backjumping
+  uint64_t chronosaved;         // Saved repropagation
+  				// during chronological backjumping.
+#endif
   uint64_t ticks;		// Propagation ticks.
+  uint64_t variables;		// Activated variables.
+#ifndef NVIVIFICATION
+  uint64_t vivify_reused;
+  uint64_t vivify_probes;
+  uint64_t vivify_strengthened;
+  uint64_t vivify_subsume;
+  uint64_t vivified;
+  uint64_t vivifications;
+  uint64_t vivify_implied;
+  uint64_t vivify_conflicts;
+  uint64_t probing_ticks;       // Number of elimination ticks.
+  uint64_t vivify_propagations;	// Propagated literals.
+#endif
 };
 
 /*------------------------------------------------------------------------*/
@@ -490,12 +654,12 @@ struct heap
 
 /*------------------------------------------------------------------------*/
 
-// Analyzed / seen variables (enables sorting with respect to stamps).
+// Analyzed variables (enables sorting with respect to stamps).
 
 struct analyzed
 {
   unsigned idx;
-#ifndef NSORT
+#ifndef NSORTANALYZED
   unsigned stamp;		// Needed for sorting bumped variables only.
 #endif
 };
@@ -520,6 +684,22 @@ struct trail
   unsigned *propagate;		// Position of next literal to propagate.
 };
 
+#ifndef NCONTROL
+struct level
+{
+  unsigned * trail; // trail start of this level
+  unsigned lvl;
+  struct {
+    unsigned earliest;
+    unsigned count;
+  } seen;
+};
+
+struct control
+{
+  struct level *begin, *end, *allocated;	// As in 'stack' (can use stack macros).
+};
+#endif
 /*------------------------------------------------------------------------*/
 
 // Exponential moving averages (for 'exp' see below).
@@ -540,41 +720,76 @@ struct averages
 
 /*------------------------------------------------------------------------*/
 
-// We use this idiom of defining at compile-time a list of code parameters
+// We use an idiom of defining at compile-time a list of code parameters
 // multiple times (here 'PROFILES', but also see 'REPORTS' below and
 // 'SIGNALS' in 'main.c').  The idea is that the parameter list contains the
 // variations of some common code, that is compile-time parameters of that
 // code.  Here for example the common code will be in the 'PROFILE' macro
-// (singular) which then is instantiated with its single parameter (we use
-// 'NAME') if just write 'PROFILES' (plural).  The point is that we can use
-// that parameter in 'PROFILE' at compile both as symbol as well as string
-// (with '#NAME'), or even generate new symbols (see 'SIGNALS' in 'main.c').
+// (singular) which is then instantiated with its single parameter (we use
+// 'NAME') if we just write 'PROFILES' (plural).  This way  we can use that
+// parameter in 'PROFILE' at compile time as symbol as well as string (with
+// '#NAME'), or even generate new symbols (see 'SIGNALS' in 'main.c').
 
 // *INDENT-OFF*
-
 #define PROFILES \
-PROFILE_IF_FOCUSED (focused)    /* Time spent in focused mode. */ \
-PROFILE (parse)                 /* Time spent parsing.         */ \
-PROFILE_IF_REDUCE (reduce)      /* Time spent reduce.          */ \
-PROFILE (solve)                 /* Time spent solving.         */ \
-PROFILE_IF_STABLE (stable)      /* Time spent in stable mode.  */ \
-PROFILE (total)			/* Total time spent.           */
+PROFILE_IF_FOCUSED (focused)     /* Time spent in focused mode. */ \
+PROFILE_IF_ELIMINATION (eliminate) /* Time spent in elimination. */ \
+PROFILE (parse)                  /* Time spent parsing. */ \
+PROFILE_IF_REDUCE (reduce)       /* Time spent reduce. */ \
+PROFILE (solve)                  /* Time spent solving. */ \
+PROFILE_IF_STABLE (stable)       /* Time spent in stable mode. */ \
+PROFILE_IF_SUBSUMPTION (subsume) /* Time spent in full subsumption. */ \
+PROFILE_IF_NCHEAP (decide)	 /* Total time deciding. */ \
+PROFILE_IF_NCHEAP (minishrink)	 /* Total time minimizing and shrinking. */ \
+PROFILE_IF_VIVIFICATION (vivify) /* Time spent in vivification */ \
+PROFILE (total)			 /* Total time spent. */
 
 #define DO_NOT_PROFILE(ARG) /**/
+
 #ifndef NFOCUSED
 #define PROFILE_IF_FOCUSED PROFILE
 #else
 #define PROFILE_IF_FOCUSED DO_NOT_PROFILE
 #endif
+
 #ifndef NREDUCE
 #define PROFILE_IF_REDUCE PROFILE
 #else
 #define PROFILE_IF_REDUCE DO_NOT_PROFILE
 #endif
+
 #ifndef NSTABLE
 #define PROFILE_IF_STABLE PROFILE
 #else
 #define PROFILE_IF_STABLE DO_NOT_PROFILE
+#endif
+
+#ifndef NSUBSUMPTION
+#define PROFILE_IF_SUBSUMPTION PROFILE
+#else
+#define PROFILE_IF_SUBSUMPTION DO_NOT_PROFILE
+#endif
+
+#ifndef NELIMINATION
+#define PROFILE_IF_ELIMINATION PROFILE
+#else
+#define PROFILE_IF_ELIMINATION DO_NOT_PROFILE
+#endif
+
+#ifndef NVIVIFICATION
+#define PROFILE_IF_VIVIFICATION PROFILE
+#else
+#define PROFILE_IF_VIVIFICATION DO_NOT_PROFILE
+#endif
+
+#ifndef DNCHEAPPROFILING
+#define PROFILE_IF_NCHEAP PROFILE
+#define START_IF_NCHEAP START
+#define STOP_IF_NCHEAP STOP
+#else
+#define PROFILE_IF_NCHEAP DO_NOT_PROFILE
+#define START_IF_NCHEAP (A)
+#define STOP_IF_NCHEAP (A)
 #endif
 
 // *INDENT-ON*
@@ -597,6 +812,21 @@ struct profiles
   struct profile **end;
 };
 
+// Variable flags.
+
+struct flags
+{
+  bool active:1;		// Active so neither fixed nor eliminated.
+#ifndef NELIMINATION
+  bool eliminate:1;		// Removed since last 'eliminate'.
+  bool eliminated:1;		// Variable eliminated in 'eliminate'.
+#endif
+  bool fixed:1;			// Root-level assigned variable (unit).
+#ifndef NSUBSUMPTION
+  unsigned subsume:2;		// Newly added after last 'subsume'.
+#endif
+};
+
 /*------------------------------------------------------------------------*/
 
 // The full solver state is captured in this structure.
@@ -607,12 +837,14 @@ struct satch
   bool inconsistent;		// Empty clause found or derived.
   bool iterate;			// Report learned unit clause.
   bool stable;			// Stable mode (fewer restarts).
+  bool dense;			// Dense mode (connected - not watched).
   unsigned level;		// Current decision level.
   unsigned size;		// Number of variables.
   size_t capacity;		// Allocated variables.
   unsigned unassigned;		// Number of unassigned variables.
   unsigned *levels;		// Decision levels of variables.
   signed char *values;		// Current assignment of literals.
+  struct flags *flags;		// Variable flags.
 #ifndef NSAVE
   signed char *saved;		// Saved assignments of variables.
 #endif
@@ -625,14 +857,20 @@ struct satch
   unsigned best;		// Best trail size.
 #endif
   signed char *marks;		// Mark flags of variables.
-#ifndef NACTIVE
-  bool *active;			// Active flags of variables.
+#ifndef NLAZYACTIVATION
   struct unsigned_stack put[2];	// To be put on decision queue / heap.
 #endif
 #ifndef NMINIMIZE
-  struct unsigned_stack marked;	// Marked variables.
+  struct unsigned_stack poisoned;	// Variables marked as poisoned.
+  struct unsigned_stack removable;	// Variables marked as removable.
 #endif
-  signed char *frames;		// Analyzed flag for each level.
+#ifndef NSHRINK
+  struct unsigned_stack shrunken;	// Shrunken variables.
+#endif
+#ifndef NCONTROL
+  unsigned *position;		// Variable position on trail.
+#endif
+  signed char *frames;		// Level pulled in learned clauses.
 #ifndef NQUEUE
   struct queue queue[2];	// Variable decision queue (stable=1).
 #endif
@@ -641,17 +879,25 @@ struct satch
 #endif
   struct clause **reasons;	// Reason clauses of a variable.
 #ifndef NBLOCK
-  struct clause binary;		// Temporary binary conflict.
+  struct clause binary[2];	// Temporary binary clauses.
+#endif
+#ifndef NBINARIES
+  struct unsigned_stack binaries;	// Saved redundant binary clauses.
+#endif
+#ifndef NELIMINATION
+  struct unsigned_stack extend;	// Solution reconstruction.
+  struct unsigned_stack resolvents;	// Temporary resolvents.
 #endif
   struct watches *watches;	// Watches of a literal.
   struct trail trail;		// Assigned literals.
-  struct analyzed_stack seen;	// Analyzed literals.
+#ifndef NCONTROL
+  struct control control;	// control structure
+#endif
+  struct analyzed_stack analyzed;	// Analyzed literals.
   struct unsigned_stack clause;	// Temporary clause.
   struct unsigned_stack blocks;	// Analyzed decision levels.
   struct clauses irredundant;	// Current irredundant clauses.
-#ifndef NLEARN
   struct clauses redundant;	// Current redundant clauses.
-#endif
 #ifndef NLIMITS
   struct limits limits;		// Limits on restart, reduce, etc.
 #endif
@@ -668,6 +914,31 @@ struct satch
 #endif
   struct int_stack added;	// Added external clause.
   FILE *proof;			// Tracing to this file if non-zero.
+#ifdef LOGGING
+  char format[4][128];		// String buffer for logging.
+  unsigned next_format;		// Next buffer for logging.
+#endif
+#ifndef NVIVIFICATION
+  struct unsigned_stack sorted;
+  struct unsigned_stack sorter;
+  struct clauses vivification_schedule;
+  signed char *vivify_marks;	// TODO: make marks compatible with analyzed
+  // and mark_literal at the same time.
+  bool vivifying;
+#ifndef NDEBUG
+  bool watching;
+#endif
+#endif
+#ifdef DLIS
+  // When running DLIS we save how far the clauses are satisfied to avoid
+  // rechecking them. Our implementation is not optimal, since it does not
+  // handle chronological backtracking (so clauses will be rechecked several
+  // if there are satisfied by a literal set at a lower level.). However,
+  // this does not really matter, since you should not use DLIS anyway
+  // nowadays (or you need a less lazy SAT solver).
+  struct int_stack irred_sat_upto;
+  struct int_stack red_sat_upto;
+#endif
 };
 
 // The main point of this extensive configurability is to be able to strip
@@ -784,11 +1055,14 @@ NOT (unsigned lit)
 // distinguish binary clause reasons (the other literal) from real large
 // clause reasons (pointer to the clause).  This technique requires that
 // we use the least significant bit of a pointer as flag to distinguish this
-// case and accordingly reduces the number of variables on a 32-bit system
-// to '2^30' (which will not be reachable on such a system anyhow) but on
-// 64-bit systems does not impose any restriction.
+// case and accordingly reduces the number of variables on a 32-bit system.
+// We use another bit for storing the information whether such reason clause
+// is redundant.  Thus on a 32-bit system the maximum number of variables is
+// '2^29' (which will not be reachable on such a system anyhow) but on
+// 64-bit systems we can have 'INT_MAX' variables.
 
 #define INVALID UINT_MAX
+#define INVALID_LEVEL UINT_MAX
 
 /*------------------------------------------------------------------------*/
 
@@ -868,10 +1142,13 @@ do { \
 #define all_literals(LIT) \
   unsigned LIT = 0, END_LITERALS = LITERALS; LIT < END_LITERALS; LIT++
 
-#define all_literals_in_clause(LIT,C) \
-  unsigned LIT, * P_ ## LIT = (C)->literals, \
-                * const END_ ## LIT = P_ ## LIT + (C)->size; \
+#define all_elements_in_array(TYPE,LIT,SIZE,LITS) \
+  TYPE LIT, * P_ ## LIT = (LITS), \
+            * const END_ ## LIT = P_ ## LIT + (SIZE); \
   (P_ ## LIT != END_ ## LIT) && (LIT = *P_ ## LIT, true); ++P_ ## LIT
+
+#define all_literals_in_clause(LIT,C) \
+   all_elements_in_array (unsigned, LIT, (C)->size, (C)->literals)
 
 #define all_irredundant_clauses(C) \
   all_pointers_on_stack (struct clause, C, solver->irredundant)
@@ -916,6 +1193,20 @@ do { \
 
 /*------------------------------------------------------------------------*/
 
+// Export internal unsigned literals as external signed literals.
+
+static unsigned
+export_literal (unsigned ilit)
+{
+  const unsigned iidx = INDEX (ilit);
+  assert (iidx < (unsigned) INT_MAX - 1);
+  const int eidx = iidx + 1;
+  const int elit = SIGN_BIT (ilit) ? -eidx : eidx;
+  return elit;
+}
+
+/*------------------------------------------------------------------------*/
+
 // These declarations provide nice warning messages if these functions are
 // used with format strings which do not match the type of an argument,
 // which otherwise is very hard to get right (particularly for logging).
@@ -927,12 +1218,14 @@ static void fatal_error (const char *fmt, ...)
 // out cases where message code is not included and then define 'NMESSAGE.
 
 #ifdef NBUMP
+#ifdef NELIMINATION
 #ifdef NSWITCH
 #ifdef NREDUCE
 #ifdef NREPHASE
 #ifdef NRESTART
 #ifdef NTARGET
 #define NMESSAGE
+#endif
 #endif
 #endif
 #endif
@@ -949,7 +1242,7 @@ static void message (struct satch *,
 
 #endif
 
-#ifndef NDEBUG
+#ifdef LOGGING
 
 static void logging_message (struct satch *, const char *fmt, ...)
   __attribute__((format (printf, 2, 3)));
@@ -960,6 +1253,14 @@ static void logging_binary (struct satch *solver,
 			    bool redundant, unsigned lit, unsigned other,
 			    const char *fmt, ...)
   __attribute__((format (printf, 5, 6)));
+
+#endif
+
+#ifndef NBLOCK
+
+static void logging_tagged (struct satch *solver, unsigned lit,
+			    struct clause *, const char *fmt, ...)
+  __attribute__((format (printf, 4, 5)));
 
 #endif
 
@@ -1048,7 +1349,19 @@ internal_section (struct satch *solver, const char *name)
   fflush (stdout);
 }
 
-#ifndef NDEBUG
+#if (!defined(NBLOCK) && \
+     (defined(LOGGING) || !defined(NUSED) || !defined(NCHRONO))) || \
+    (!defined(NVIRTUAL) && (!defined(NDEBUG) || !defined(NSUBSUMPTION)))
+
+static bool
+is_temporary_binary (struct satch *solver, struct clause *c)
+{
+  return c == solver->binary || c == solver->binary + 1;
+}
+
+#endif
+
+#ifdef LOGGING
 
 // Logging functions are only compiled in debugging mode and then still need
 // to be enabled at run-time (with '-l' or 'satch_enable_logging_messages').
@@ -1092,6 +1405,52 @@ logging_message (struct satch *solver, const char *fmt, ...)
   logging_suffix ();
 }
 
+static size_t
+format_literal (struct satch *solver, char *res, unsigned ilit)
+{
+  const int tmp = solver->values[ilit];
+  const int elit = export_literal (ilit);
+
+  if (!tmp)
+    return sprintf (res, "%u(%d)", ilit, elit);
+
+  const unsigned iidx = INDEX (ilit);
+  const unsigned level = solver->levels[iidx];
+  return sprintf (res, "%u(%d)@%u=%d", ilit, elit, level, tmp);
+}
+
+static char *
+next_format (struct satch *solver)
+{
+  char *res = solver->format[solver->next_format++];
+
+  if (solver->next_format == sizeof solver->format / sizeof solver->format[0])
+    solver->next_format = 0;
+
+  return res;
+}
+
+static const char *
+logging_literal (struct satch *solver, unsigned lit)
+{
+  char *res = next_format (solver);
+  (void) format_literal (solver, res, lit);
+  return res;
+}
+
+static const char *
+logging_variable (struct satch *solver, unsigned idx)
+{
+  char *res = next_format (solver);
+  char *tmp = res + sprintf (res, "variable %u literal ", idx);
+  const unsigned lit = LITERAL (idx);
+  (void) format_literal (solver, tmp, lit);
+  return res;
+}
+
+#define LOGLIT(LIT) logging_literal (solver, (LIT))
+#define LOGVAR(IDX) logging_variable (solver, (IDX))
+
 #ifndef NVIRTUAL
 
 // For virtual binary clauses we need special logging functions too.
@@ -1107,7 +1466,7 @@ logging_binary (struct satch *solver,
     printf (" redundant");
   else
     printf (" irredundant");
-  printf ("binary clause %u %u", lit, other);
+  printf (" binary clause %s %s", LOGLIT (lit), LOGLIT (other));
   logging_suffix ();
 }
 
@@ -1122,28 +1481,39 @@ logging_clause (struct satch *solver, struct clause *c, const char *fmt, ...)
 {
   logging_prefix (solver);
   logging_format (fmt);
-#ifndef NBLOCK
-  // With blocking literals enabled we use the temporary binary clause for
-  // binary reasons and binary conflicts.  This clause needs special
-  // treatment here since its identifier is invalid (always zero).
-  if (c == &solver->binary)
-    printf (" binary clause");
+#ifdef NCDCL
+  if (c == DUMMY_REASON) {
+    printf ("dummy decision clause");
+  }
   else
 #endif
     {
-      if (c->redundant)
-	{
-	  printf (" redundant");
-#ifndef NGLUE
-	  printf (" glue %u", c->glue);
-#endif
-	}
+#ifndef NBLOCK
+      // With blocking literals enabled we use the temporary binary clause for
+      // binary reasons and binary conflicts.  This clause needs special
+      // treatment here since its identifier is invalid (always zero).
+      if (is_temporary_binary (solver, c))
+        printf (" temporary binary clause");
       else
-	printf (" irredundant");
-      printf (" size %u clause[%" PRIu64 "]", c->size, c->id);
+#endif
+        {
+          if (c->redundant)
+            {
+              printf (" redundant");
+#ifndef NGLUE
+              printf (" glue %u", c->glue);
+#endif
+            }
+          else
+            printf (" irredundant");
+          printf (" size %u clause[%" PRIu64 "]", c->size, c->id);
+        }
+      for (all_literals_in_clause (lit, c))
+        printf (" %s", LOGLIT (lit));
+#ifdef NWATCHES
+      printf (" count: %d", c->count);
+#endif
     }
-  for (all_literals_in_clause (lit, c))
-    printf (" %u", lit);
   logging_suffix ();
 }
 
@@ -1156,11 +1526,9 @@ logging_temporary (struct satch *solver, const char *fmt, ...)
   logging_format (fmt);
   printf (" size %zu temporary clause", SIZE_STACK (solver->clause));
   for (all_elements_on_stack (unsigned, lit, solver->clause))
-      printf (" %u", lit);
+      printf (" %s", LOGLIT (lit));
   logging_suffix ();
 }
-
-// Log the temporary clause 'solver->clause'.
 
 #define LOG(...) \
 do { \
@@ -1176,6 +1544,16 @@ do { \
 do { \
   if (solver->options.logging) \
     logging_binary (solver, __VA_ARGS__); \
+} while (0)
+
+#endif
+
+#ifndef NBLOCK
+
+#define LOGTAGGED(...) \
+do { \
+  if (solver->options.logging) \
+    logging_tagged (solver, __VA_ARGS__); \
 } while (0)
 
 #endif
@@ -1198,10 +1576,11 @@ do { \
 
 #else
 
-// Make sure not to include logging code if 'NDEBUG' is defined.
+// Make sure not to include logging code if 'LOGGING' is undefined.
 
 #define LOG(...) do { (void) solver; } while(0)
 #define LOGBIN(...) do { (void) solver; } while(0)
+#define LOGTAGGED(...) do { (void) solver; } while(0)
 #define LOGCLS(...) do { (void) solver; } while(0)
 #define LOGTMP(...) do { (void) solver; } while(0)
 
@@ -1438,11 +1817,7 @@ print_statistics (struct satch *solver, double seconds)
 {
   internal_section (solver, "statistics");
   struct statistics s = solver->statistics;
-#if 0
   const bool verbose = solver->options.verbose > 1;
-#else
-  const bool verbose = true;	// For now always complete statistics.
-#endif
 
   // Factored out parts of the formatting string.
 
@@ -1462,6 +1837,16 @@ print_statistics (struct satch *solver, double seconds)
     printf (F1 " %" L2 PRIu64 " %" L3 ".2f literals\n", "bumped:",
 	    s.bumped, relative (s.bumped, s.conflicts));
 #endif
+#ifndef NCHRONO
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" L3 ".2f per learned\n",
+	    "chronological backtracking:", s.chrono,
+	    percent (s.chrono, s.learned));
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" L3 ".2f per jump\n",
+	    "reused level:", s.chronosaved, relative (s.chronosaved,
+						      s.chrono));
+#endif
   printf (F1 " %" L2 PRIu64 " %" L3 ".2f MB\n", "collected:",
 	  s.collected, s.collected / (double) (1u << 20));
   printf (F1 " %" L2 PRIu64 " %" L3 ".2f per second\n", "conflicts:",
@@ -1474,6 +1859,15 @@ print_statistics (struct satch *solver, double seconds)
   if (verbose)
     printf (F1 " %" L2 PRIu64 " %" P3 ".0f %%  added\n", "deleted:",
 	    s.deleted, percent (s.deleted, s.added));
+#ifndef NELIMINATION
+  printf (F1 " %" L2 PRIu64 " %" P3 ".0f %%  variables\n", "eliminated:",
+	  s.eliminated, percent (s.eliminated, s.variables));
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "eliminations:",
+	    s.eliminations, relative (s.conflicts, s.eliminations));
+#endif
+  printf (F1 " %" L2 PRIu64 " %" P3 ".0f %%  variables\n", "fixed:",
+	  s.fixed, percent (s.fixed, s.variables));
   printf (F1 " %" L2 PRIu64 " %" L3 ".2f literals\n", "learned:",
 	  s.learned, relative (s.learned, s.conflicts));
 #ifndef NVSIDS
@@ -1493,7 +1887,7 @@ print_statistics (struct satch *solver, double seconds)
 #endif
   printf (F1 " %" L2 PRIu64 " %" L3 ".2f per second\n", "propagations:",
 	  s.propagations, relative (s.propagations, seconds));
-#ifndef NREASONS
+#ifndef NBUMPREASONS
   if (verbose)
     printf (F1 " %" L2 PRIu64 " %" P3 ".0f %%  bumped\n", "reasons:",
 	    s.reasons, percent (s.reasons, s.bumped));
@@ -1501,8 +1895,9 @@ print_statistics (struct satch *solver, double seconds)
 #ifndef NREDUCE
   printf (F1 " %" L2 PRIu64 " %" L3 ".2f per reduction\n", "reduced:",
 	  s.reduced, relative (s.reduced, s.reductions));
-  printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "reductions:",
-	  s.reductions, relative (s.conflicts, s.reductions));
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "reductions:",
+	    s.reductions, relative (s.conflicts, s.reductions));
 #endif
 #ifndef NREPHASE
   printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "rephased:",
@@ -1516,21 +1911,62 @@ print_statistics (struct satch *solver, double seconds)
   printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "restamped:",
 	  s.restamped, relative (s.conflicts, s.restamped));
 #endif
+#ifndef NELIMINATION
+  printf (F1 " %" L2 PRIu64 " %" L3 ".2f per variable\n", "resolutions:",
+	  s.resolutions, relative (s.resolutions, s.variables));
+#endif
 #ifndef NRESTART
   printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "restarts:",
 	  s.restarts, relative (s.conflicts, s.restarts));
 #endif
 #ifndef NREUSE
-  printf (F1 " %" L2 PRIu64 " %" P3 ".0f %%  restarts\n", "reused:",
-	  s.reused, percent (s.reused, s.restarts));
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" P3 ".0f %%  restarts\n", "reused:",
+	    s.reused, percent (s.reused, s.restarts));
+#endif
+#ifndef NSHRINK
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" P3 ".0f %%  deduced\n", "shrunken:",
+	    s.shrunken, percent (s.shrunken, s.deduced));
+#endif
+#ifndef NSUBSUMPTION
+  printf (F1 " %" L2 PRIu64 " %" P3 ".0f %%  added\n", "strengthened:",
+	  s.strengthened, percent (s.strengthened, s.added));
+  printf (F1 " %" L2 PRIu64 " %" P3 ".0f %%  added\n", "subsumed:",
+	  s.subsumed, percent (s.subsumed, s.added));
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "subsumptions:",
+	    s.subsumptions, relative (s.conflicts, s.subsumptions));
 #endif
 #ifndef NSWITCH
-  printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "switched:",
-	  s.switched, relative (s.conflicts, s.switched));
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "switched:",
+	    s.switched, relative (s.conflicts, s.switched));
 #endif
 #ifndef NTARGET
-  printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "targets:",
-	  s.targets, relative (s.conflicts, s.targets));
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" L3 ".2f interval\n", "targets:",
+	    s.targets, relative (s.conflicts, s.targets));
+#endif
+#ifndef NVIVIFICATION
+  printf (F1 " %" L2 PRIu64 " %" P3 ".0f per round\n",
+	  "vivified:", s.vivified, relative (s.vivified, s.vivifications));
+  printf (F1 " %" L2 PRIu64 " %" P3 ".0f per round\n",
+	  "     propagations:", s.vivify_propagations,
+	  relative (s.vivify_propagations, s.vivifications));
+  printf (F1 " %" L2 PRIu64 " %" P3 ".0f per propagation\n",
+	  "     ticks:", s.probing_ticks,
+	  relative (s.probing_ticks, s.vivify_propagations));
+  printf (F1 " %" L2 PRIu64 " %" P3 ".0f per round\n",
+	  "     subsume:", s.vivify_subsume,
+	  relative (s.vivify_subsume, s.vivifications));
+  printf (F1 " %" L2 PRIu64 " %" P3 ".0f per round\n",
+	  "     strengthen:", s.vivify_strengthened,
+	  relative (s.vivify_strengthened, s.vivifications));
+  if (verbose)
+    printf (F1 " %" L2 PRIu64 " %" P3 ".2f per vivification\n",
+	    "     reused:", s.vivify_reused,
+	    relative (s.vivify_reused, s.vivified));
 #endif
   if (verbose)
     printf (F1 " %" L2 PRIu64 " %" L3 ".2f per propagation\n", "ticks:",
@@ -1545,20 +1981,6 @@ print_resource_usage (struct satch *solver, double seconds)
   printf ("c %-24s %17" PRIu64 " bytes %11.2f MB\n",
 	  "memory:", memory, memory / (double) (1 << 20));
   printf ("c %-24s %17s %17.2f seconds\n", "time:", "", seconds);
-}
-
-/*------------------------------------------------------------------------*/
-
-// Export internal unsigned literals as external signed literals.
-
-static unsigned
-export_literal (unsigned ilit)
-{
-  const unsigned iidx = INDEX (ilit);
-  assert (iidx < (unsigned) INT_MAX - 1);
-  const int eidx = iidx + 1;
-  const int elit = SIGN_BIT (ilit) ? -eidx : eidx;
-  return elit;
 }
 
 /*------------------------------------------------------------------------*/
@@ -1644,14 +2066,109 @@ end_proof_line (struct satch *solver)
   fflush (solver->proof);
 }
 
+/*------------------------------------------------------------------------*/
+
+// The following functions combine both proof tracing and checking with the
+// internal checker the addition and deletion of a given clause.  For
+// addition proof and checker make sure that the clause is implied (through
+// unit propagation) and for deletion it is first checked that the clause
+// has been added before or was added as original clause and has not been
+// deleted yet (followed by actually deleting it in the proof and checker).
+
+// Trace and check addition of the clause given as array.
+
 static void
-add_internal_clause_to_proof (struct satch *solver)
+trace_and_check_addition (struct satch *solver,
+			  size_t size, unsigned *literals, unsigned except)
 {
-  start_addition_proof_line (solver);
-  for (all_elements_on_stack (unsigned, lit, solver->clause))
-      add_internal_literal_to_proof_line (solver, lit);
-  end_proof_line (solver);
+  if (solver->proof)
+    {
+      start_addition_proof_line (solver);
+      for (all_elements_in_array (unsigned, lit, size, literals))
+	if (lit != except)
+	    add_internal_literal_to_proof_line (solver, lit);
+      end_proof_line (solver);
+    }
+#ifndef NDEBUG
+  for (all_elements_in_array (unsigned, lit, size, literals))
+    if (lit != except)
+        checker_add_literal (solver->checker, export_literal (lit));
+  checker_add_learned_clause (solver->checker);
+#endif
 }
+
+// Trace and check deletion of the clause given as array.
+
+static void
+trace_and_check_deletion (struct satch *solver,
+			  size_t size, unsigned *literals)
+{
+  if (solver->proof)
+    {
+      start_deletion_proof_line (solver);
+      for (all_elements_in_array (unsigned, lit, size, literals))
+	  add_internal_literal_to_proof_line (solver, lit);
+      end_proof_line (solver);
+    }
+#if !defined(NDEBUG) && !defined(NLEARN)
+  for (all_elements_in_array (unsigned, lit, size, literals))
+      checker_add_literal (solver->checker, export_literal (lit));
+  checker_delete_clause (solver->checker);
+#endif
+}
+
+static void
+trace_and_check_empty_addition (struct satch *solver)
+{
+  trace_and_check_addition (solver, 0, 0, INVALID);
+}
+
+static void
+trace_and_check_unit_addition (struct satch *solver, unsigned unit)
+{
+  trace_and_check_addition (solver, 1, &unit, INVALID);
+}
+
+// Trace and check the temporary clause as being added.
+
+static void
+trace_and_check_temporary_addition (struct satch *solver)
+{
+  const size_t size = SIZE_STACK (solver->clause);
+  trace_and_check_addition (solver, size, solver->clause.begin, INVALID);
+}
+
+#if !defined(NVIRTUAL) && \
+  (!defined(NREDUCE) || !defined(NDEBUG) || \
+   !defined(NELIMINATION))
+
+static void
+trace_and_check_binary_deletion (struct satch *solver,
+				 unsigned lit, unsigned other)
+{
+  unsigned literals[2] = { lit, other };
+  trace_and_check_deletion (solver, 2, literals);
+}
+
+#endif
+
+#if !defined (NSTRENGTHENING) || !defined (NVIVIFICATION)
+
+static void
+trace_and_check_clause_addition (struct satch *solver,
+				 struct clause *c, unsigned remove)
+{
+  trace_and_check_addition (solver, c->size, c->literals, remove);
+}
+
+#endif
+
+static void
+trace_and_check_clause_deletion (struct satch *solver, struct clause *c)
+{
+  trace_and_check_deletion (solver, c->size, c->literals);
+}
+
 
 /*------------------------------------------------------------------------*/
 
@@ -1725,9 +2242,13 @@ deallocate_clause (struct clause *c)
 // We start with the shared clause allocation function 'add_clause'.
 
 static struct clause *
+#ifndef NGLUE
 add_clause (struct satch *solver, bool redundant, unsigned glue)
+#else
+add_clause (struct satch *solver, bool redundant)
+#endif
 {
-#if !defined(NDEBUG) || defined(NRSORT)
+#if defined(LOGGING) || defined(NRADIXSORT)
   const uint64_t added =
 #endif
     INC (added);
@@ -1738,7 +2259,7 @@ add_clause (struct satch *solver, bool redundant, unsigned glue)
   assert (size > 2);		// No binary clauses allocated at all!
 #endif
   struct clause *res = allocate_clause (size);
-#if !defined(NDEBUG) || defined(NRSORT)
+#if defined(LOGGING) || defined(NRADIXSORT)
   res->id = added;
 #endif
   res->garbage = false;
@@ -1747,15 +2268,24 @@ add_clause (struct satch *solver, bool redundant, unsigned glue)
 #ifndef NUSED
   res->used = 0;
 #endif
+#ifndef NSUBSUMPTION
+  res->subsumed = false;
+#endif
+#ifdef NWATCHES
+  res->sum = 0;
+  res->count = 0;
+#endif
 #ifndef NGLUE
   res->glue = glue;
-#else
-  (void) glue;
 #endif
 #ifndef NCACHE
   res->search = 0;
 #endif
   res->size = size;
+#ifndef NVIVIFICATION
+  res->vivify = 0;
+  res->shrunken = false;
+#endif
   memcpy (res->literals, solver->clause.begin, size * sizeof (unsigned));
   return res;
 }
@@ -1763,22 +2293,36 @@ add_clause (struct satch *solver, bool redundant, unsigned glue)
 static struct clause *
 new_irredundant_clause (struct satch *solver)
 {
+#ifndef NGLUE
   struct clause *res = add_clause (solver, false, 0);
+#else
+  struct clause *res = add_clause (solver, false);
+#endif
   PUSH (solver->irredundant, res);
   INC (irredundant);
   return res;
 }
 
+#ifndef NCDCL
 static struct clause *
+#ifndef NGLUE
 new_redundant_clause (struct satch *solver, unsigned glue)
+#else
+new_redundant_clause (struct satch *solver)
+#endif
 {
+#ifndef NGLUE
   struct clause *res = add_clause (solver, true, glue);
+#else
+  struct clause *res = add_clause (solver, true);
+#endif
 #ifndef NLEARN
   PUSH (solver->redundant, res);
 #endif
   INC (redundant);
   return res;
 }
+#endif
 
 // Deleting clauses beside deallocation implicitly also triggers adding a
 // deletion line to the proof (if tracing is enabled) and in debugging
@@ -1792,22 +2336,14 @@ delete_clause (struct satch *solver, struct clause *c)
 {
   INC (deleted);
   LOGCLS (c, "delete");
-  if (solver->proof)
+  if (!c->garbage)
     {
-      start_deletion_proof_line (solver);
-      for (all_literals_in_clause (lit, c))
-	add_internal_literal_to_proof_line (solver, lit);
-      end_proof_line (solver);
+      trace_and_check_clause_deletion (solver, c);
+      if (c->redundant)
+	DEC (redundant);
+      else
+	DEC (irredundant);
     }
-#if !defined(NDEBUG) && !defined(NLEARN)
-  for (all_literals_in_clause (lit, c))
-    checker_add_literal (solver->checker, export_literal (lit));
-  checker_delete_clause (solver->checker);
-#endif
-  if (c->redundant)
-    DEC (redundant);
-  else
-    DEC (irredundant);
   return deallocate_clause (c);
 }
 
@@ -1815,36 +2351,125 @@ delete_clause (struct satch *solver, struct clause *c)
 
 // Watch a literal 'lit' in a clause with blocking literal 'other'.
 
+#ifndef NBLOCK
+
 static void
-watch_literal (struct satch *solver, unsigned lit,
-	       unsigned blocking, struct clause *c)
+watch_literal (struct satch *solver, bool redundant,
+	       unsigned lit, unsigned blocking, struct clause *c)
 {
+  assert (!solver->dense);
   struct watches *watches = solver->watches + lit;
   union watch watch;
-#ifndef NBLOCK
   watch.header.binary = (c->size == 2);
+  watch.header.redundant = redundant;
   watch.header.blocking = blocking;
-  LOGCLS (c, "watching %u blocking %u in", lit, blocking);
+  LOGCLS (c, "watching %s blocking %s in", LOGLIT (lit), LOGLIT (blocking));
   PUSH (*watches, watch);
-#else
-  (void) blocking;		// Prevent 'unused parameter' warning.
-  LOGCLS (c, "watching %u in", lit);
-#endif
-  watch.clause = c;		// In any case watch the clause.
+  watch.clause = c;
   PUSH (*watches, watch);
 }
+
+#elif !defined(NWATCHES)
+
+static void
+watch_literal (struct satch *solver, unsigned lit, struct clause *c)
+{
+  assert (!solver->dense);
+  struct watches *watches = solver->watches + lit;
+  union watch watch;
+  LOGCLS (c, "watching %s in", LOGLIT (lit));
+  watch.clause = c;
+  PUSH (*watches, watch);
+}
+
+#endif
+
+#if !defined(NREDUCE) || !defined(NELIMINATION) || \
+    !defined(NCHRONO) || !defined(NVIVIFICATION)
+
+#ifndef NBLOCK
+
+static void
+unwatch_literal (struct satch *solver, unsigned lit, struct clause *c)
+{
+  assert (!solver->dense);
+  struct watches *watches = solver->watches + lit;
+  const union watch *const end = watches->end;
+  union watch *q = watches->begin;
+  for (;;)
+    {
+      assert (q != end);
+#if !defined(NVIRTUAL) || defined(LOGGING)
+      const union watch watch = *q++;
+      const struct header header = watch.header;
+#endif
+#ifndef NVIRTUAL
+      if (header.binary)
+	continue;
+#endif
+      const struct clause *d = q++->clause;
+      if (c == d)
+	{
+	  LOGCLS (c, "unwatching %s blocking %s in",
+		  LOGLIT (lit), LOGLIT (header.blocking));
+	  break;
+	}
+    }
+  while (q != end)
+    q[-2] = *q, q++;
+  watches->end -= 2;
+}
+
+#elif !defined(NWATCHES)
+
+static void
+unwatch_literal (struct satch *solver, unsigned lit, struct clause *c)
+{
+  assert (!solver->dense);
+  struct watches *watches = solver->watches + lit;
+  const union watch *const end = watches->end;
+  union watch *q = watches->begin;
+  for (;;)
+    {
+      assert (q != end);
+      const struct clause *d = q++->clause;
+      if (c == d)
+	{
+	  LOGCLS (c, "unwatching %s in", LOGLIT (lit));
+	  break;
+	}
+    }
+  while (q != end)
+    q[-1] = *q, q++;
+  watches->end--;
+}
+
+#endif
+
+#endif
+
+#ifndef NWATCHES
 
 // Watch first two literals in the clause.
 
 static void
 watch_clause (struct satch *solver, struct clause *c)
 {
+  assert (!solver->dense);
   assert (c->size > 1);
   const unsigned lit = c->literals[0];
   const unsigned other = c->literals[1];
-  watch_literal (solver, lit, other, c);
-  watch_literal (solver, other, lit, c);
+#ifndef NBLOCK
+  const bool redundant = c->redundant;
+  watch_literal (solver, redundant, lit, other, c);
+  watch_literal (solver, redundant, other, lit, c);
+#else
+  watch_literal (solver, lit, c);
+  watch_literal (solver, other, c);
+#endif
 }
+
+#endif
 
 /*------------------------------------------------------------------------*/
 
@@ -1857,248 +2482,137 @@ watch_clause (struct satch *solver, struct clause *c)
 static void
 init_binary (struct satch *solver)
 {
-  solver->binary.size = 2;
+  for (unsigned i = 0; i < 2; i++)
+    {
+      struct clause *binary = solver->binary + i;
+      binary->size = 2;
 #ifdef NVARIADIC
-  const size_t bytes = 2 * sizeof (unsigned);
-  solver->binary.literals = malloc (bytes);
-  if (!solver->binary.literals)
-    out_of_memory (bytes);
+      const size_t bytes = 2 * sizeof (unsigned);
+      if (!(binary->literals = malloc (bytes)))
+	out_of_memory (bytes);
 #endif
+    }
 }
 
 static void
 release_binary (struct satch *solver)
 {
 #ifdef NVARIADIC
-  free (solver->binary.literals);
+  for (unsigned i = 0; i < 2; i++)
+    free (solver->binary[i].literals);
 #else
-  (void) solver;
+  (void) solver;		// Prevent unused 'solver' warning.
 #endif
 }
 
-// Copy 'lit' and 'other' to the (single) temporary binary clause in the
+// Copy 'lit' and 'other' to one of the two temporary binary clauses in the
 // solver.  This is used for generating a binary clause conflict (if
-// 'NBLOCK' is undefined) and indirectly through 'binary_reason_to_clause'
-// to unify the conflict analysis code with and without 'NBLOCK'.
+// 'NBLOCK' is undefined) and through 'untag_clause' to unify the conflict
+// analysis code with and without 'NBLOCK'.
 
 static struct clause *
-binary_clause (struct satch *solver, unsigned lit, unsigned other)
+binary_clause (struct satch *solver, unsigned pos,
+	       bool redundant, unsigned lit, unsigned other)
 {
-  solver->binary.literals[0] = lit;
-  solver->binary.literals[1] = other;
-  return &solver->binary;
+  assert (pos == 0 || pos == 1);
+  struct clause *res = solver->binary + pos;
+  assert (!res->garbage);
+  assert (res->size == 2);
+  res->redundant = redundant;
+  res->literals[0] = lit;
+  res->literals[1] = other;
+  return res;
 }
+
+/*------------------------------------------------------------------------*/
 
 // We want to only have one global 'reason' array in which we store both
 // binary clause reasons (which consists of just the other literal) as well
 // as pointers to large clause.  We distinguish those by 'stuffing' a bit
 // into the clause pointer.  In case the least-significant bit is set then
 // the rest of the 'reason' pointer forms the other literal.  Otherwise it
-// is the actual pointer to a large clause.  Note that the least significant
-// bit of a pointer is zero on all systems we have seen and this is a common
-// idiom anyhow (for instance for AIG and BDD packages).
+// is the actual pointer to a large clause.
+
+// Note that the least two significant bits of a pointer are zero on all
+// systems we have seen and this is a common idiom anyhow (for instance in
+// AIG and BDD packages). For logging we thus can also use the second least
+// significant bit for storing whether the binary (reason) is redundant.
 
 // Some technical details follow on why this scheme works perfectly well on
 // 64-bit machines.  On such machines pointer size is twice the size of
 // 'unsigned' literals and the 32-bit variable-index easily fits into the
-// upper 63 bits of a reason pointer.  On 32-bit machines this might break
-// for literals larger equal to 2^31 which is however prevented by raising
+// upper 62 bits of a reason pointer.  On 32-bit machines this might break
+// for literals larger equal to 2^30 which is however prevented by raising
 // an API contract violation, when trying to import a variable of size
-// larger than 2^30.  Thus on 32-bit machines we 'only' have 2^30 variables.
+// larger than 2^29.  Thus on 32-bit machines we 'only' have 2^29 variables.
 // Trying to reach this limit on a 32-bit machine would probably lead to
-// memory overflow much earlier anyhow.
+// a memory overflow much earlier anyhow.
 
 static bool
-is_binary_reason (const struct clause *const c)
+is_tagged_clause (const struct clause *const c)
 {
   uintptr_t word = (uintptr_t) c;
-  return word & 1;
+  return !!(word & 3);
 }
 
 static struct clause *
-binary_reason (uintptr_t other)
+tag_binary_clause (bool redundant, uintptr_t other)
 {
-  const uintptr_t tmp = (other << 1) | 1;
+  const uintptr_t tmp = (other << 2) | 1 | (redundant << 1);
   struct clause *res = (struct clause *) tmp;
-  assert (is_binary_reason (res));
+  assert (is_tagged_clause (res));
   return res;
 }
 
 static unsigned
-binary_reason_to_literal (const struct clause *reason)
+tagged_clause_to_literal (const struct clause *c)
 {
-  assert (is_binary_reason (reason));
-  const uintptr_t tmp = (uintptr_t) reason;
-  const unsigned res = tmp >> 1;
+  assert (is_tagged_clause (c));
+  const uintptr_t tmp = (uintptr_t) c;
+  const unsigned res = tmp >> 2;
   return res;
 }
 
+static unsigned
+tagged_clause_to_redundant (const struct clause *c)
+{
+  assert (is_tagged_clause (c));
+  const uintptr_t tmp = (uintptr_t) c;
+  const bool res = !!(tmp & 2);
+  return res;
+}
+
+#if defined(LOGGING)
+
+static void
+logging_tagged (struct satch *solver, unsigned lit,
+		struct clause *c, const char *fmt, ...)
+{
+  const unsigned other = tagged_clause_to_literal (c);
+  const bool redundant = tagged_clause_to_redundant (c);
+  logging_prefix (solver);
+  logging_format (fmt);
+  if (redundant)
+    printf (" redundant");
+  else
+    printf (" irredundant");
+  printf (" binary clause %s %s", LOGLIT (lit), LOGLIT (other));
+  logging_suffix ();
+}
+
+#endif
+
 static struct clause *
-binary_reason_to_clause (struct satch *solver,
-			 unsigned lit, const struct clause *reason)
+untag_clause (struct satch *solver,
+	      unsigned pos, unsigned lit, const struct clause *c)
 {
-  assert (is_binary_reason (reason));
-  const unsigned other = binary_reason_to_literal (reason);
-  return binary_clause (solver, lit, other);
+  assert (is_tagged_clause (c));
+  const unsigned other = tagged_clause_to_literal (c);
+  const bool redundant = tagged_clause_to_redundant (c);
+  return binary_clause (solver, pos, redundant, lit, other);
 }
 
 #endif
-
-/*------------------------------------------------------------------------*/
-
-#ifndef NVIRTUAL
-
-// This section handles virtual binary clauses which only reside in watch
-// lists but are not actually allocated. This feature (disabled without
-// defining 'NVIRTUAL') can save up to a factor of four in memory usage.
-
-static inline void
-watch_binary (struct satch *solver,
-	      bool redundant, unsigned lit, unsigned blocking)
-{
-  union watch watch;
-  watch.header.binary = true;
-  watch.header.redundant = redundant;
-  watch.header.blocking = blocking;
-  PUSH (solver->watches[lit], watch);
-  LOGBIN (redundant, lit, blocking,
-	  "watching %u blocking %u in", lit, blocking);
-}
-
-static void
-new_binary (struct satch *solver, bool redundant)
-{
-  assert (SIZE_STACK (solver->clause) == 2);
-  const unsigned lit = ACCESS (solver->clause, 0);
-  const unsigned other = ACCESS (solver->clause, 1);
-  watch_binary (solver, redundant, lit, other);
-  watch_binary (solver, redundant, other, lit);
-  if (redundant)
-    INC (redundant);
-  else
-    INC (irredundant);
-}
-
-#if !defined(NREDUCE) || (!defined(NDEBUG) && !defined(NVIRTUAL))
-
-// In contrast to large clauses deleting virtual binary clauses does not
-// deallocate any memory but statistics have to be adapted.  We also need to
-// trigger adding deletion lines to proofs and the checker if enabled.  See
-// the corresponding discussion before 'delete_clause' above too.
-
-static void
-delete_binary (struct satch *solver,
-	       bool redundant, unsigned lit, unsigned other)
-{
-  // We watch 'lit' in the watch list of 'other' and vice versa. Thus when
-  // we delete these virtual binary clauses (residing only in watch lists)
-  // we do not know which of the two cases we encounter first but both
-  // occurrences should trigger 'delete_binary'.  Thus we delete the virtual
-  // binary clause only once when 'lit' is smaller than 'other'.
-
-  if (lit > other)
-    return;
-
-  LOGBIN (redundant, lit, other, "delete");
-  if (solver->proof)
-    {
-      start_deletion_proof_line (solver);
-      add_internal_literal_to_proof_line (solver, lit);
-      add_internal_literal_to_proof_line (solver, other);
-      end_proof_line (solver);
-    }
-#if !defined(NDEBUG) && !defined(NLEARN)
-  checker_add_literal (solver->checker, export_literal (lit));
-  checker_add_literal (solver->checker, export_literal (other));
-  checker_delete_clause (solver->checker);
-#endif
-  if (redundant)
-    DEC (redundant);
-  else
-    DEC (irredundant);
-}
-
-#endif
-
-#ifndef NDEBUG
-
-// Short-hand only used in 'internal_release' in debugging mode.
-
-static void
-delete_header (struct satch *solver, unsigned lit, struct header header)
-{
-  const bool redundant = header.redundant;
-  const unsigned blocking = header.blocking;
-  delete_binary (solver, redundant, lit, blocking);
-}
-
-#endif
-
-#endif
-
-/*------------------------------------------------------------------------*/
-
-static void
-assign (struct satch *solver, unsigned lit, struct clause *reason)
-{
-#ifndef NDEBUG
-#ifndef NBLOCK
-  if (is_binary_reason (reason))
-    LOG ("assign %u reason temporary binary reason %u %u",
-	 lit, lit, binary_reason_to_literal (reason));
-  else
-#endif
-  if (reason)
-    LOGCLS (reason, "assign %u reason", lit);
-  else if (!solver->level)
-    LOG ("assign %u through unit clause %u", lit, lit);
-  else
-    LOG ("assign %u decision", lit);
-#endif
-
-  if (!solver->level)
-    {
-      solver->statistics.fixed++;	// Root-level fixed literal (unit).
-
-      assert (solver->statistics.active);
-      solver->statistics.active--;	// One less active variable.
-
-      reason = 0;
-    }
-
-  const unsigned not_lit = NOT (lit);
-  assert (!solver->values[lit]);
-  assert (!solver->values[not_lit]);
-
-  // Set value of 'lit' and 'not-lit' independently in order to turn the
-  // code for accessing the value of a literal into a simple array look-up
-  // as well. This makes it simpler and branch-less too.
-
-  solver->values[lit] = 1;
-  solver->values[not_lit] = -1;
-
-  const unsigned idx = INDEX (lit);
-
-#ifndef NSAVE
-
-  // Saved value is used as decision phase if 'idx' is picked as decision.
-
-  solver->saved[idx] = INT_SIGN (lit);
-#endif
-
-  solver->reasons[idx] = reason;	// Remember reason clause.
-  solver->levels[idx] = solver->level;	// Remember decision level.
-
-  // Add literal to the partial assignment in the pre-allocated 'trail'.
-
-  assert (solver->trail.end < solver->trail.begin + VARIABLES);
-  *solver->trail.end++ = lit;
-
-  // Used for fast termination check on 'satisfiable' instances.
-
-  assert (solver->unassigned);
-  solver->unassigned--;
-}
 
 /*------------------------------------------------------------------------*/
 
@@ -2126,284 +2640,16 @@ do { \
   const size_t size = sizeof *(P); \
   const size_t old_bytes = \
     old_capacity ? FACTOR * (size_t) (old_capacity + ADJUST) * size : 0; \
-  const size_t new_bytes = FACTOR * (size_t) (new_capacity + ADJUST) * size; \
+  const size_t new_bytes = FACTOR * \
+                           (size_t) (new_capacity + ADJUST) * size; \
   void * chunk = calloc (new_bytes, 1); \
   if (!chunk) \
     out_of_memory (new_bytes); \
-  memcpy (chunk, (P), old_bytes); \
+  if (old_bytes) \
+    memcpy (chunk, (P), old_bytes); \
   free ((P)); \
   (P) = chunk; \
 } while (0)
-
-/*------------------------------------------------------------------------*/
-
-// Facilitates to activate variables in the order they appear in the input
-// by putting them on each of the two 'put' stacks, which allows to delay
-// initialization of the decision queue / heap and only when the queue or
-// the heap is queried through 'get_queue' resp. 'get_scores' it is filled
-// in the order in which the variables occur in the formula.
-
-#ifndef NACTIVE
-
-static void
-activate_literals (struct satch *solver)
-{
-  bool *active = solver->active;
-  for (all_elements_on_stack (unsigned, lit, solver->clause))
-    {
-      const unsigned idx = INDEX (lit);
-      if (active[idx])
-	continue;
-      active[idx] = true;
-      LOG ("activated variable %u", idx);
-#ifndef NFOCUSED
-      PUSH (solver->put[0], idx);
-#endif
-#ifndef NSTABLE
-      PUSH (solver->put[1], idx);
-#endif
-      solver->statistics.active++;
-      solver->unassigned++;
-    }
-}
-
-#endif
-
-/*------------------------------------------------------------------------*/
-#ifndef NQUEUE
-/*------------------------------------------------------------------------*/
-
-// Functions to implement a doubly-linked variable decision queue.
-
-#ifndef NBUMP
-
-// We use 32-bit enqueue time stamps which overflow rather frequently after
-// roughly 4 billion enqueue operations.  In this case we just go over all
-// variable links in order of the decision queue and assign fresh stamps.
-
-// Even for many variables (the maximum variable index is '(1u<<31) - 2') we
-// still need a billion enqueue operations before this triggers and thus the
-// accumulated complexity for this operation can be ignored.
-
-static void
-restamp_queue (struct satch *solver, struct queue *queue)
-{
-  const uint64_t restamped = INC (restamped);
-  message (solver, 2, "restamp", restamped,
-	   "restamping indices in decision queue");
-  struct link *links = queue->links, *link;
-  unsigned stamp = 0;
-  for (unsigned idx = queue->first; idx != INVALID; idx = link->next)
-    {
-      link = links + idx;
-      assert (stamp < UINT_MAX);
-      link->stamp = ++stamp;
-    }
-  queue->search = queue->last;
-  queue->stamp = stamp;
-}
-
-#endif
-
-// Simple doubly linked list enqueue operation at the end of the queue with
-// time stamping, where the time is the 'enqueue time'.  The 'search' index
-// of the queue is also updated if this variable is unassigned.
-
-static void
-enqueue (struct satch *solver, struct queue *queue, unsigned idx)
-{
-  LOG ("enqueue %u", idx);
-  struct link *const links = queue->links;
-  struct link *const link = links + idx;
-  const unsigned last = queue->last;
-  if (last == INVALID)
-    {
-      assert (queue->first == INVALID);
-      queue->first = idx;
-    }
-  else
-    {
-      struct link *const prev = links + last;
-      assert (prev->next == INVALID);
-      prev->next = idx;
-    }
-  link->prev = last;
-  queue->last = idx;
-  link->next = INVALID;
-
-  // Now comes the 'stamping' trick from our SAT'2015 paper which makes sure
-  // that time stamps respect queue order and can thus be used to compare in
-  // constant time whether an element is to the left or right of the cached
-  // search index, which during searching for unassigned decision variables
-  // is set to the last decision variable index first and then updated in
-  // case a variable right to the cached search index becomes unassigned
-  // during backtracking.  This technique makes sure that right to the
-  // search index all variables are assigned in the decision queue.  See
-  // also the code involving stamps in 'backtrack' and in 'decide'.
-
-  link->stamp = ++queue->stamp;
-#ifdef NBUMP
-  assert (link->stamp);
-#else
-  if (link->stamp)		// Check for overflow.
-#endif
-    {
-      LOG ("enqueued variable %u stamped %u", idx, link->stamp);
-      const unsigned lit = LITERAL (idx);
-      if (!solver->values[lit])
-	queue->search = idx;
-    }
-#ifndef NBUMP
-  else
-    restamp_queue (solver, queue);
-#endif
-}
-
-#ifndef NVMTF
-
-// Simple doubly linked list dequeue operation (no stamping involved).
-
-static void
-dequeue (struct satch *solver, struct queue *queue, unsigned idx)
-{
-  LOG ("dequeue %u", idx);
-  struct link *const links = queue->links;
-  struct link *const link = links + idx;
-  const unsigned prev_idx = link->prev;
-  const unsigned next_idx = link->next;
-  if (prev_idx == INVALID)
-    {
-      assert (queue->first == idx);
-      queue->first = next_idx;
-    }
-  else
-    {
-      struct link *const prev = links + prev_idx;
-      assert (prev->next == idx);
-      prev->next = next_idx;
-    }
-  if (next_idx == INVALID)
-    {
-      assert (queue->last == idx);
-      queue->last = prev_idx;
-    }
-  else
-    {
-      struct link *next = links + next_idx;
-      assert (next->prev == idx);
-      next->prev = prev_idx;
-    }
-}
-
-#endif
-
-/*------------------------------------------------------------------------*/
-
-// The solver might have actually two queues (by default only one in focused
-// mode though).  This could in principle be figured out at compile time but
-// leads to extremely complex preprocessor macro checking code.  Instead we
-// initialize the queue lazily on-demand if 'size' is not big enough.
-
-static void
-resize_queue (struct queue *queue, size_t new_capacity)
-{
-  RESIZE_UNINITIALIZED (queue->links);
-}
-
-static void
-init_queue (struct satch *solver, struct queue *queue)
-{
-  if (!queue->size)
-    queue->first = queue->last = queue->search = INVALID;
-  if (!queue->links)
-    resize_queue (queue, solver->capacity);
-}
-
-#ifndef NACTIVE
-
-// Put variables on the decision queue in the order in which the variables
-// are activated (found in the input). Since the last activated variables is
-// enqueued last, reverse activation order gives initial decision order.
-
-static void
-activate_queue (struct satch *solver, struct queue *queue,
-		struct unsigned_stack *activate)
-{
-  init_queue (solver, queue);
-  const unsigned stable = solver->stable;
-  LOG ("activating %zu variables on queue[%u]", SIZE_STACK (*activate),
-       stable);
-  for (all_elements_on_stack (unsigned, idx, *activate))
-    {
-      INC (activated[stable]);
-      enqueue (solver, queue, idx);
-    }
-  RELEASE_STACK (*activate);
-  queue->size = solver->size;
-}
-
-#else
-
-// Otherwise put variables on the decision queue in index order.  Since the
-// variable with the largest index is enqueued last, reverse index order
-// gives the initial decision order.
-
-static void
-fill_queue (struct satch *solver, struct queue *queue)
-{
-  init_queue (solver, queue);
-  const unsigned stable = solver->stable;
-  LOG ("filling queue[%u] with %zu variables",
-       stable, (size_t) (solver->size - queue->size));
-  while (queue->size < solver->size)
-    {
-      INC (filled[stable]);
-      enqueue (solver, queue, queue->size++);
-    }
-}
-
-#endif
-
-static struct queue *
-get_queue (struct satch *solver)
-{
-  const unsigned stable = solver->stable;
-  struct queue *queue = &solver->queue[stable];
-#ifndef NACTIVE
-  struct unsigned_stack *activate = &solver->put[stable];
-  if (!EMPTY_STACK (*activate))
-    activate_queue (solver, queue, activate);
-#else
-  if (queue->size < solver->size)
-    fill_queue (solver, queue);
-#endif
-  assert (queue->size == solver->size);
-  return queue;
-}
-
-#ifndef NVMTF
-
-static void
-move_variable_to_front (struct satch *solver, unsigned idx)
-{
-  INC (moved);
-  LOG ("moving variable %u to front of decision queue", idx);
-  struct queue *queue = get_queue (solver);
-  dequeue (solver, queue, idx);
-  enqueue (solver, queue, idx);
-}
-
-#endif
-
-static void
-release_queue (struct queue *queue)
-{
-  free (queue->links);
-}
-
-/*------------------------------------------------------------------------*/
-#endif
-/*------------------------------------------------------------------------*/
 
 /*------------------------------------------------------------------------*/
 #ifndef NHEAP
@@ -2419,6 +2665,7 @@ release_queue (struct queue *queue)
 // zero initialized 'size'.
 
 #if 0
+
 static void
 check_heap (struct heap *heap)
 {
@@ -2448,6 +2695,8 @@ check_heap (struct heap *heap)
 	    }
 	}
     }
+#else
+  (void) heap;			// Prevent unsigned 'heap' warning.
 #endif
 }
 
@@ -2554,7 +2803,7 @@ max_heap (struct heap *heap)
   return ACCESS (*heap, 0);
 }
 
-static void
+static unsigned
 pop_heap (struct satch *solver, struct heap *heap)
 {
   check_heap (heap);
@@ -2565,19 +2814,14 @@ pop_heap (struct satch *solver, struct heap *heap)
   pos[res] = INVALID;
   const unsigned last = POP (*heap);
   if (last == res)
-    return;
+    return res;
   pos[last] = 0;
   heap->begin[0] = last;
   bubble_down (solver, heap, last);
+  return res;
 }
 
 #ifndef NVSIDS
-
-static double
-heap_score (struct heap *heap, unsigned idx)
-{
-  return heap->score[idx];
-}
 
 static void
 update_heap (struct satch *solver, struct heap *heap,
@@ -2597,6 +2841,12 @@ update_heap (struct satch *solver, struct heap *heap,
       if (heap->pos[idx] != INVALID)
 	bubble_down (solver, heap, idx);
     }
+}
+
+static double
+heap_score (struct heap *heap, unsigned idx)
+{
+  return heap->score[idx];
 }
 
 static void
@@ -2643,6 +2893,7 @@ release_heap (struct heap *heap)
   free (heap->begin);
   free (heap->pos);
   free (heap->score);
+  memset (heap, 0, sizeof *heap);
 }
 
 static void
@@ -2654,7 +2905,7 @@ init_scores (struct satch *solver, struct heap *scores)
     resize_heap (scores, 0, solver->capacity);
 }
 
-#ifndef NACTIVE
+#ifndef NLAZYACTIVATION
 
 // Put variables on the scores binary heap in the order in which the
 // variables are activated (found in the input). Since the first activated
@@ -2728,7 +2979,7 @@ get_scores (struct satch *solver)
 {
   const unsigned stable = solver->stable;
   struct heap *scores = &solver->scores[stable];
-#ifndef NACTIVE
+#ifndef NLAZYACTIVATION
   struct unsigned_stack *activate = &solver->put[stable];
   if (!EMPTY_STACK (*activate))
     activate_scores (solver, scores, activate);
@@ -2749,7 +3000,7 @@ bump_variable_score (struct satch *solver, unsigned idx)
   struct heap *scores = get_scores (solver);
   const double old_score = heap_score (scores, idx);
   const double new_score = old_score + scores->increment;
-  LOG ("bumping score of variable %u to %g", idx, new_score);
+  LOG ("bumping score of %s to %g", LOGVAR (idx), new_score);
   update_heap (solver, scores, idx, new_score);
   if (new_score > MAX_SCORE)
     rescore_scores (solver, scores);
@@ -2764,6 +3015,915 @@ bump_score_increment (struct satch *solver)
 }
 
 #endif
+
+#endif
+
+
+#ifdef DLIS
+static bool
+update_score_dlis (struct satch *solver, struct clause *cl, unsigned *counts,
+		   signed char const *const values)
+{
+  bool satisfied = false;
+  for (all_literals_in_clause (lit, cl))
+    {
+      if (values[lit] || !solver->flags[INDEX (lit)].active)
+	{
+	  satisfied = true;
+	  break;
+	}
+    }
+  if (satisfied)
+    {
+      LOGCLS (cl, "clause is satisfied or should be skipped");
+      return true;
+    }
+
+
+  const int shift = 12 - cl->size;
+  const int64_t score = shift < 1 ? 1 : (1l << shift);
+
+  for (all_literals_in_clause (lit, cl))
+    {
+      counts[lit] += score;
+    }
+  return false;
+}
+
+// The algorithm should also give values to inactive variables too. However,
+// those variables should only be set at the very end, when all other variables
+// have been set (and the problem is SAT -- this is required in order to
+// reconstruct the model in case of elimination). We chose to not require this
+// from the rank function (hence the 'inactive' flag in the last loop).
+static unsigned
+max_score_dlis (struct satch *solver)
+{
+  assert (EMPTY_STACK (solver->analyzed));
+  signed char *values = solver->values;
+  struct flags const *const flags = solver->flags;
+  unsigned *counts = calloc (LITERALS, sizeof (unsigned));
+  assert (SIZE_STACK (solver->irred_sat_upto) + 1 == solver->level);
+  assert (SIZE_STACK (solver->red_sat_upto) + 1 == solver->level);
+  int sat_upto =
+    EMPTY_STACK (solver->irred_sat_upto) ? 0 : TOP (solver->irred_sat_upto);
+
+  for (int i = solver->irredundant.end - solver->irredundant.begin - 1;
+       i >= sat_upto;)
+    {
+      struct clause *cl = solver->irredundant.begin[i];
+      if (cl->garbage)
+	{
+	  --i;
+	  continue;
+	}
+      LOGCLS (cl, "checking clause for DLIS");
+      if (update_score_dlis (solver, cl, counts, values))
+	{
+	  struct clause *tmp = solver->irredundant.begin[sat_upto];
+	  solver->irredundant.begin[sat_upto++] = cl;
+	  solver->irredundant.begin[i] = tmp;
+	}
+      else
+	--i;
+    }
+
+  PUSH (solver->irred_sat_upto, sat_upto);
+  sat_upto =
+    EMPTY_STACK (solver->red_sat_upto) ? 0 : TOP (solver->red_sat_upto);
+
+  for (int i = solver->redundant.end - solver->redundant.begin - 1;
+       i >= sat_upto;)
+    {
+      struct clause *cl = solver->redundant.begin[i];
+      LOGCLS (cl, "checking clause for DLIS");
+      if (cl->garbage)
+	{
+	  --i;
+	  continue;
+	}
+      if (update_score_dlis (solver, cl, counts, values))
+	{
+	  struct clause *tmp = solver->redundant.begin[sat_upto];
+	  solver->redundant.begin[sat_upto++] = cl;
+	  solver->redundant.begin[i] = tmp;
+	}
+      else
+        --i;
+    }
+
+  PUSH (solver->red_sat_upto, sat_upto);
+
+  for (all_literals (lit))
+    {
+      if (values[lit] != 0)
+	continue;
+      if (!flags[INDEX (lit)].active)
+	continue;
+#if !defined(NBLOCK) && !defined(NVIRTUAL)
+      struct watches *watches = solver->watches + lit;
+      const union watch *const end = watches->end;
+      for (const union watch * p = watches->begin; p != end; p++)
+	{
+	  const struct header header = p->header;
+	  if (header.binary)
+	    {
+	      const unsigned blocking_lit = header.blocking;
+	      if (values[blocking_lit] != 1)
+		update_score_dlis (solver, binary_clause (solver, 0,
+							  header.redundant,
+							  NOT (lit),
+							  blocking_lit),
+				   counts, values);
+	    }
+	  else
+              ++p;
+	}
+#endif
+    }
+
+#define rank_analyzed(A) \
+      (counts [LITERAL (A)] * counts [NOT (LITERAL(A))])
+
+  unsigned var = INVALID;
+  unsigned score = 0;
+  bool inactive = true; // inactive has lowest possible rank
+  for (all_variables (idx)) {
+    if (solver->values[LITERAL (idx)])
+      continue;
+    if (var == INVALID) {
+      var = idx;
+      if (solver->flags[idx].active)
+        score = rank_analyzed (idx), inactive = false;
+      continue;
+    }
+    if (!solver->flags[idx].active)
+      continue;
+    if (inactive || score > rank_analyzed (idx)) {
+      score = rank_analyzed (idx);
+      var = idx;
+    }
+  }
+
+#ifdef NSAVE
+  unsigned lit;
+  if (counts[LITERAL (var)] > counts[NOT (LITERAL (var))])
+    lit = LITERAL (var);
+  else
+    lit = NOT (LITERAL (var));
+  CLEAR_STACK (solver->analyzed);
+  free (counts);
+  LOG ("DLIS selecting lit %s", LOGLIT (lit));
+  return lit;
+#else
+  CLEAR_STACK (solver->analyzed);
+  free (counts);
+  LOG ("DLIS selecting var %s", LOGLIT (LITERAL (var)));
+  return var;
+#endif
+}
+
+/*------------------------------------------------------------------------*/
+#endif
+/*------------------------------------------------------------------------*/
+
+
+#ifndef NELIMINATION
+
+// Variables which occur in an irredundant clause which is deleted are
+// marked as candidates for variable eliminations.
+
+// For instance if a unit clause is learned during search and an irredundant
+// clauses becomes satisfied and then during reduction is removed, the other
+// variables in such a clause should be retried to be eliminated in the next
+// variable elimination round since they now occur less often.
+
+// We also use the 'marked_eliminate' counter to wait in 'eliminating' until
+// we really have a chance to eliminate a new variable.
+
+// We have to put this code early since clause deletion calls it.
+
+static void
+mark_eliminate_literal (struct satch *solver, unsigned lit)
+{
+  const unsigned idx = INDEX (lit);
+  struct flags *f = solver->flags + idx;
+  if (!f->active)
+    return;
+  if (f->eliminate)
+    return;
+  LOG ("marking %s as elimination candidate", LOGVAR (idx));
+  f->eliminate = true;
+  INC (marked_eliminate);
+}
+
+static void
+mark_eliminate_clause (struct satch *solver, struct clause *c)
+{
+  for (all_literals_in_clause (lit, c))
+    mark_eliminate_literal (solver, lit);
+}
+
+#endif
+
+#if !defined(NSUBSUMPTION) && (!defined(NREDUCE) || !defined(NELIMINATION))
+
+// For subsumption a similar approach is used, except that variables are
+// considered subsumption candidates if an irredundant clause is added.
+
+static void
+mark_subsume_variable (struct satch *solver, unsigned idx)
+{
+  struct flags *f = solver->flags + idx;
+  if (!f->active)
+    return;
+  if (f->subsume & 1)
+    return;
+  LOG ("marking %s as subsume candidate", LOGVAR (idx));
+  f->subsume |= 1;
+  INC (marked_subsume);
+}
+
+
+static void
+mark_subsume_literal (struct satch *solver, unsigned lit)
+{
+  const unsigned idx = INDEX (lit);
+  mark_subsume_variable (solver, idx);
+}
+
+#endif
+
+/*------------------------------------------------------------------------*/
+
+#ifndef NVIRTUAL
+
+// This section handles virtual binary clauses which only reside in watch
+// lists but are not actually allocated. This feature (disabled without
+// defining 'NVIRTUAL') can save up to a factor of four in memory usage.
+
+static inline void
+watch_binary (struct satch *solver,
+	      bool redundant, unsigned lit, unsigned blocking)
+{
+  union watch watch;
+  watch.header.binary = true;
+  watch.header.redundant = redundant;
+  watch.header.blocking = blocking;
+  PUSH (solver->watches[lit], watch);
+  LOGBIN (redundant, lit, blocking,
+	  "watching %s blocking %s in", LOGLIT (lit), LOGLIT (blocking));
+}
+
+static void
+add_new_binary_and_watch_it (struct satch *solver, bool redundant)
+{
+  assert (SIZE_STACK (solver->clause) == 2);
+  const unsigned lit = ACCESS (solver->clause, 0);
+  const unsigned other = ACCESS (solver->clause, 1);
+  watch_binary (solver, redundant, lit, other);
+  watch_binary (solver, redundant, other, lit);
+  if (redundant)
+    INC (redundant);
+  else
+    INC (irredundant);
+}
+
+#if !defined(NREDUCE) || !defined(NDEBUG) || !defined(NELIMINATION)
+
+// In contrast to large clauses deleting virtual binary clauses does not
+// deallocate any memory but statistics have to be adapted.  We also need to
+// trigger adding deletion lines to proofs and the checker if enabled.  See
+// the corresponding discussion before 'delete_clause' above too.  Last but
+// not least we have to update counts of literals and 'eliminate' flags.
+
+static void
+really_delete_binary (struct satch *solver,
+		      bool redundant, unsigned lit, unsigned other)
+{
+  LOGBIN (redundant, lit, other, "delete");
+  trace_and_check_binary_deletion (solver, lit, other);
+#ifndef NELIMINATION
+  if (!redundant)
+    {
+      mark_eliminate_literal (solver, lit);
+      mark_eliminate_literal (solver, other);
+    }
+#endif
+  if (redundant)
+    DEC (redundant);
+  else
+    DEC (irredundant);
+}
+
+static void
+delete_binary (struct satch *solver,
+	       bool redundant, unsigned lit, unsigned other)
+{
+  // We watch 'lit' in the watch list of 'other' and vice versa. Thus when
+  // we delete these virtual binary clauses (residing only in watch lists)
+  // we do not know which of the two cases we encounter first but both
+  // occurrences should trigger 'delete_binary'.  Thus we delete the virtual
+  // binary clause only once when 'lit' is smaller than 'other'.
+
+  if (lit < other)
+    really_delete_binary (solver, redundant, lit, other);
+}
+
+#endif
+
+#ifndef NDEBUG
+
+// Short-hand only used in 'internal_release' in debugging mode.
+
+static void
+delete_header (struct satch *solver, unsigned lit, struct header header)
+{
+  const bool redundant = header.redundant;
+  const unsigned blocking = header.blocking;
+  delete_binary (solver, redundant, lit, blocking);
+}
+
+#endif
+
+#endif // of '#ifndef NVIRTUAL'
+
+/*------------------------------------------------------------------------*/
+
+static void
+mark_garbage (struct satch *solver, struct clause *c, const char *msg)
+{
+#ifndef NVIRTUAL
+  assert (!is_tagged_clause (c));
+  assert (!is_temporary_binary (solver, c));
+#endif
+  assert (!c->garbage);
+  LOGCLS (c, "%s thus marked garbage", msg);
+  c->garbage = true;
+  trace_and_check_deletion (solver, c->size, c->literals);
+  if (c->redundant)
+    DEC (redundant);
+  else
+    DEC (irredundant);
+#ifndef NELIMINATION
+  if (!c->redundant)
+    {
+      mark_eliminate_clause (solver, c);
+    }
+#endif
+#ifndef LOGGING
+  (void) msg;			// Prevent unused 'msg' warning.
+#endif
+}
+
+/*------------------------------------------------------------------------*/
+
+#if !defined(NELIMINATION) || defined(NWATCHES)
+
+// Connect literal in irredundant clause.
+
+static void
+connect_literal (struct satch *solver, unsigned lit, struct clause *c)
+{
+#ifndef NWATCHES
+  assert (solver->dense);
+#endif
+#ifdef LOGGING
+#ifndef NVIRTUAL
+  if (is_tagged_clause (c))
+    LOGTAGGED (lit, c, "connecting %s to", LOGLIT (lit));
+  else
+#endif
+    LOGCLS (c, "connecting %s to", LOGLIT (lit));
+#endif
+#if !defined(NDEBUG) && !defined(NVIRTUAL)
+  if (!is_tagged_clause (c))
+    assert (!c->garbage);
+#endif
+  const union watch watch = {.clause = c };
+  PUSH (solver->watches[lit], watch);
+}
+
+static void
+connect_clause (struct satch *solver, struct clause *c)
+{
+  for (all_literals_in_clause (lit, c))
+    connect_literal (solver, lit, c);
+}
+
+/*------------------------------------------------------------------------*/
+
+#if (!defined(NSUBSUMPTION) && !defined(NVIRTUAL)) || \
+    (!defined(NELIMINATION) && !defined(NVIRTUAL)) || \
+    !defined(NSTRENGTHENING) || \
+    ((!defined(NVIVIFICATION) || !defined(NREDUCE) || !defined(NELIMINATION)) && defined(NWATCHES))
+
+static void
+disconnect_literal (struct satch *solver, unsigned lit, struct clause *c)
+{
+#ifndef NWATCHES
+  assert (solver->dense);
+#endif
+#ifdef LOGGING
+#ifndef NVIRTUAL
+  if (is_tagged_clause (c))
+    LOGTAGGED (lit, c, "disconnecting %s from", LOGLIT (lit));
+  else
+#endif
+    LOGCLS (c, "disconnecting %s from", LOGLIT (lit));
+#endif
+  struct watches *watches = solver->watches + lit;
+  const union watch *const end = watches->end;
+  union watch *q = watches->begin;
+  while (assert (q != end), q->clause != c)
+    q++;
+  while (++q != end)
+    q[-1] = *q;
+  watches->end--;
+  if (EMPTY_STACK (*watches))
+    RELEASE_STACK (*watches);
+}
+
+#endif
+
+#endif
+
+/*------------------------------------------------------------------------*/
+
+#ifdef NWATCHES
+
+static void
+count_clause (struct satch *solver, struct clause *c)
+{
+  unsigned sum = 0, count = 0;
+
+  const signed char * const values = solver->values;
+#ifndef NCHRONO
+  const unsigned propagated = solver->trail.propagate - solver->trail.begin;
+#endif
+  for (all_literals_in_clause (lit, c))
+    {
+	signed char tmp = values[lit];
+#ifndef NCHRONO
+	if (tmp < 0 && solver->position[INDEX (lit)] < propagated)
+	  continue;
+#else
+	if (tmp < 0)
+	  continue;
+#endif
+	count++;
+	sum += lit;
+    }
+
+  c->sum = sum;
+  c->count = count;
+  LOGCLS (c, "count set to %u in", count);
+}
+
+#endif
+
+/*------------------------------------------------------------------------*/
+static inline unsigned
+assignement_level (struct satch *solver, unsigned lit, struct clause *reason)
+{
+  if (!reason
+#ifndef NVIVIFICATION
+      || solver->vivifying
+#endif
+      )
+    return solver->level;
+
+#ifdef NCHRONO
+  (void) reason;
+  (void) lit;
+  return solver->level;
+#else
+  struct clause *fullreason;
+#ifndef NBLOCK
+  if (is_tagged_clause (reason))
+    {
+      const unsigned other = tagged_clause_to_literal (reason);
+      assert (solver->values[other]);
+      LOG ("found assignment level %d", solver->levels[INDEX (other)]);
+      return solver->levels[INDEX (other)];
+    }
+  else
+#endif
+    fullreason = reason;
+  unsigned level = 0;
+  for (all_literals_in_clause (other, fullreason))
+    {
+      if (other == lit)
+	continue;
+      assert (solver->values[other]);
+      const unsigned tmp = solver->levels[INDEX (other)];
+      if (tmp > level)
+	level = tmp;
+    }
+  LOG ("found assignment level %d", level);
+  return level;
+#endif
+}
+
+// Assigning the literal 'lit' with the reason. Two special cases:
+//
+//   1. for decisions, the reason is empty but the solver->level > 0
+//   2. for units, either known_unit is true or solver->level == 0
+//
+// The 'known_unit' parameter is not necessary without chronological backtracking.
+static void
+assign (struct satch *solver, unsigned lit, struct clause *reason,
+	bool known_unit)
+{
+#ifdef LOGGING
+#ifndef NBLOCK
+  if (is_tagged_clause (reason))
+    LOGTAGGED (lit, reason, "assign %s reason", LOGLIT (lit));
+  else
+#endif
+  if (reason)
+    LOGCLS (reason, "assign %s reason", LOGLIT (lit));
+  else if (!solver->level || known_unit)
+    LOG ("assign %s through unit clause %s", LOGLIT (lit), LOGLIT (lit));
+  else
+    LOG ("assign %s decision", LOGLIT (lit));
+#endif
+
+  // Garbage clauses can not be reasons.
+
+#if !defined(NDEBUG) && !defined(NCDCL)
+#ifndef NBLOCK
+  if (!is_tagged_clause (reason))
+#endif
+    if (reason)
+      assert (!reason->garbage);
+#endif
+
+  const unsigned idx = INDEX (lit);
+  const unsigned level =
+    known_unit ? 0 : assignement_level (solver, lit, reason);
+  if (!known_unit && !level)
+    {
+      LOG ("delayed unit");
+      reason = 0;
+    }
+  known_unit = known_unit || !level;
+  if (!solver->level || known_unit)
+    {
+      LOG ("new fixed %s", LOGLIT (lit));
+      solver->statistics.fixed++;	// Root-level fixed literal (unit).
+
+      assert (solver->statistics.remaining);
+      solver->statistics.remaining--;	// One less active variable.
+
+      struct flags *f = solver->flags + idx;
+      assert (f->active);
+      f->active = false;
+      assert (!f->fixed);
+      f->fixed = true;
+
+      trace_and_check_unit_addition (solver, lit);
+      if (reason
+#ifdef NCDCL
+	  && reason != DUMMY_REASON
+#endif
+	)
+	{
+#ifndef NBLOCK
+	  if (!is_tagged_clause (reason))
+#endif
+	    mark_garbage (solver, reason, "root-level forcing");
+	  reason = 0;
+	}
+    }
+
+  const unsigned not_lit = NOT (lit);
+  assert (!solver->values[lit]);
+  assert (!solver->values[not_lit]);
+
+  // Set value of 'lit' and 'not-lit' independently in order to turn the
+  // code for accessing the value of a literal into a simple array look-up
+  // as well. This makes it simpler and branch-less too.
+
+  solver->values[lit] = 1;
+  solver->values[not_lit] = -1;
+
+#ifndef NSAVE
+
+  // Saved value is used as decision phase if 'idx' is picked as decision.
+#ifndef NVIVIFICATION
+  if (!solver->vivifying)
+#endif
+    solver->saved[idx] = INT_SIGN (lit);
+#endif
+  solver->reasons[idx] = reason;	// Remember reason clause.
+  solver->levels[idx] = level;	// Remember decision level.
+
+#ifndef NCONTROL
+  solver->position[idx] = SIZE_STACK (solver->trail);
+#endif
+
+  // Add literal to the partial assignment in the pre-allocated 'trail'.
+
+  assert (solver->trail.end < solver->trail.begin + VARIABLES);
+  *solver->trail.end++ = lit;
+
+#ifndef NCONTROL
+  if (reason == 0 && solver->level && !known_unit)
+    {
+      LOG ("pushing trail position %zd at height %zd",
+	   SIZE_STACK (solver->trail), SIZE_STACK (solver->control));
+      struct level level = {.trail = solver->trail.end - 1,
+	.lvl = solver->level,
+	.seen = {.earliest = UINT32_MAX,.count = 0}
+      };
+      PUSH (solver->control, level);
+    }
+#endif
+  // Used for fast termination check on 'satisfiable' instances.
+
+  assert (solver->unassigned);
+  solver->unassigned--;
+
+#ifndef NCONTROL
+  assert (solver->level == SIZE_STACK (solver->control));
+#endif
+}
+
+/*------------------------------------------------------------------------*/
+
+// Activating variables means adding them to the solver.
+
+// It is also helpful to activate variables in the order they appear in the
+// input by putting them on each of the two 'put' stacks, which allows to
+// delay initialization of the decision queue / heap and only when the queue
+// or the heap is queried through 'get_queue' resp. 'get_scores' it is
+// filled in the order in which the variables occur in the formula.
+
+static void
+activate_literals (struct satch *solver)
+{
+  struct flags *flags = solver->flags;
+  for (all_elements_on_stack (unsigned, lit, solver->clause))
+    {
+      const unsigned idx = INDEX (lit);
+      struct flags *f = flags + idx;
+      if (f->active)
+	continue;
+      f->active = true;
+#ifndef NSUBSUMPTION
+      f->subsume = 1;
+      INC (marked_subsume);
+#endif
+#ifndef NELIMINATION
+      f->eliminate = true;
+      INC (marked_eliminate);
+#endif
+      LOG ("activated %s", LOGVAR (idx));
+#ifndef NLAZYACTIVATION
+#ifndef NFOCUSED
+      PUSH (solver->put[0], idx);
+#endif
+#ifndef NSTABLE
+      PUSH (solver->put[1], idx);
+#endif
+#endif
+      solver->statistics.remaining++;
+      solver->statistics.variables++;
+      solver->unassigned++;
+    }
+}
+
+/*------------------------------------------------------------------------*/
+#ifndef NQUEUE
+/*------------------------------------------------------------------------*/
+
+// Functions to implement a doubly-linked variable decision queue.
+
+#ifndef NBUMP
+
+// We use 32-bit enqueue time stamps which overflow rather frequently after
+// roughly 4 billion enqueue operations.  In this case we just go over all
+// variable links in order of the decision queue and assign fresh stamps.
+
+// Even for many variables (the maximum variable index is '(1u<<31) - 2') we
+// still need a billion enqueue operations before this triggers and thus the
+// accumulated complexity for this operation can be ignored.
+
+static void
+restamp_queue (struct satch *solver, struct queue *queue)
+{
+  const uint64_t restamped = INC (restamped);
+  message (solver, 2, "restamp", restamped,
+	   "restamping indices in decision queue");
+  struct link *links = queue->links, *link;
+  unsigned stamp = 0;
+  for (unsigned idx = queue->first; idx != INVALID; idx = link->next)
+    {
+      link = links + idx;
+      assert (stamp < UINT_MAX);
+      link->stamp = ++stamp;
+    }
+  queue->search = queue->last;
+  queue->stamp = stamp;
+}
+
+#endif
+
+// Simple doubly linked list enqueue operation at the end of the queue with
+// time stamping, where the time is the 'enqueue time'.  The 'search' index
+// of the queue is also updated if this variable is unassigned.
+
+static void
+enqueue (struct satch *solver, struct queue *queue, unsigned idx)
+{
+  LOG ("enqueue %u", idx);
+  struct link *const links = queue->links;
+  struct link *const link = links + idx;
+  const unsigned last = queue->last;
+  if (last == INVALID)
+    {
+      assert (queue->first == INVALID);
+      queue->first = idx;
+    }
+  else
+    {
+      struct link *const prev = links + last;
+      assert (prev->next == INVALID);
+      prev->next = idx;
+    }
+  link->prev = last;
+  queue->last = idx;
+  link->next = INVALID;
+
+  // Now comes the 'stamping' trick from our SAT'2015 paper which makes sure
+  // that time stamps respect queue order and can thus be used to compare in
+  // constant time whether an element is to the left or right of the cached
+  // search index, which during searching for unassigned decision variables
+  // is set to the last decision variable index first and then updated in
+  // case a variable right to the cached search index becomes unassigned
+  // during backtracking.  This technique makes sure that right to the
+  // search index all variables are assigned in the decision queue.  See
+  // also the code involving stamps in 'backtrack' and in 'decide'.
+
+  link->stamp = ++queue->stamp;
+#ifdef NBUMP
+  assert (link->stamp);
+#else
+  if (link->stamp)		// Check for overflow.
+#endif
+    {
+      LOG ("enqueued %s stamped %u", LOGVAR (idx), link->stamp);
+      const unsigned lit = LITERAL (idx);
+      if (!solver->values[lit])
+	queue->search = idx;
+    }
+#ifndef NBUMP
+  else
+    restamp_queue (solver, queue);
+#endif
+}
+
+#ifndef NVMTF
+
+// Simple doubly linked list dequeue operation (no stamping involved).
+
+static void
+dequeue (struct satch *solver, struct queue *queue, unsigned idx)
+{
+  LOG ("dequeue %u", idx);
+  struct link *const links = queue->links;
+  struct link *const link = links + idx;
+  const unsigned prev_idx = link->prev;
+  const unsigned next_idx = link->next;
+  if (prev_idx == INVALID)
+    {
+      assert (queue->first == idx);
+      queue->first = next_idx;
+    }
+  else
+    {
+      struct link *const prev = links + prev_idx;
+      assert (prev->next == idx);
+      prev->next = next_idx;
+    }
+  if (next_idx == INVALID)
+    {
+      assert (queue->last == idx);
+      queue->last = prev_idx;
+    }
+  else
+    {
+      struct link *next = links + next_idx;
+      assert (next->prev == idx);
+      next->prev = prev_idx;
+    }
+}
+
+#endif
+
+/*------------------------------------------------------------------------*/
+
+// The solver might have actually two queues (by default only one in focused
+// mode though).  This could in principle be figured out at compile time but
+// leads to extremely complex preprocessor macro checking code.  Instead we
+// initialize the queue lazily on-demand if 'size' is not big enough.
+
+static void
+resize_queue (struct queue *queue, size_t new_capacity)
+{
+  RESIZE_UNINITIALIZED (queue->links);
+}
+
+static void
+init_queue (struct satch *solver, struct queue *queue)
+{
+  if (!queue->size)
+    queue->first = queue->last = queue->search = INVALID;
+  if (!queue->links)
+    resize_queue (queue, solver->capacity);
+}
+
+#ifndef NLAZYACTIVATION
+
+// Put variables on the decision queue in the order in which the variables
+// are activated (found in the input). Since the last activated variables is
+// enqueued last, reverse activation order gives initial decision order.
+
+static void
+activate_queue (struct satch *solver, struct queue *queue,
+		struct unsigned_stack *activate)
+{
+  init_queue (solver, queue);
+  const unsigned stable = solver->stable;
+  LOG ("activating %zu variables on queue[%u]", SIZE_STACK (*activate),
+       stable);
+  for (all_elements_on_stack (unsigned, idx, *activate))
+    {
+      INC (activated[stable]);
+      enqueue (solver, queue, idx);
+    }
+  RELEASE_STACK (*activate);
+  queue->size = solver->size;
+}
+
+#else
+
+// Otherwise put variables on the decision queue in index order.  Since the
+// variable with the largest index is enqueued last, reverse index order
+// gives the initial decision order.
+
+static void
+fill_queue (struct satch *solver, struct queue *queue)
+{
+  init_queue (solver, queue);
+  const unsigned stable = solver->stable;
+  LOG ("filling queue[%u] with %zu variables",
+       stable, (size_t) (solver->size - queue->size));
+  while (queue->size < solver->size)
+    {
+      INC (filled[stable]);
+      enqueue (solver, queue, queue->size++);
+    }
+}
+
+#endif
+
+static struct queue *
+get_queue (struct satch *solver)
+{
+  const unsigned stable = solver->stable;
+  struct queue *queue = &solver->queue[stable];
+#ifndef NLAZYACTIVATION
+  struct unsigned_stack *activate = &solver->put[stable];
+  if (!EMPTY_STACK (*activate))
+    activate_queue (solver, queue, activate);
+#else
+  if (queue->size < solver->size)
+    fill_queue (solver, queue);
+#endif
+  assert (queue->size == solver->size);
+  return queue;
+}
+
+#ifndef NVMTF
+
+static void
+move_variable_to_front (struct satch *solver, unsigned idx)
+{
+  INC (moved);
+  LOG ("moving %s to front of decision queue", LOGVAR (idx));
+  struct queue *queue = get_queue (solver);
+  dequeue (solver, queue, idx);
+  enqueue (solver, queue, idx);
+}
+
+#endif
+
+static void
+release_queue (struct queue *queue)
+{
+  free (queue->links);
+}
 
 /*------------------------------------------------------------------------*/
 #endif
@@ -2841,10 +4001,11 @@ increase_capacity (struct satch *solver, unsigned new_capacity)
   RESIZE_ZERO_INITIALIZED (1, solver->bests, 0);
 #endif
   RESIZE_ZERO_INITIALIZED (1, solver->marks, 0);
-#ifndef NACTIVE
-  RESIZE_ZERO_INITIALIZED (1, solver->active, 0);
-#endif
+  RESIZE_ZERO_INITIALIZED (1, solver->flags, 0);
   RESIZE_ZERO_INITIALIZED (1, solver->frames, 1);
+#ifndef NCONTROL
+  RESIZE_UNINITIALIZED (solver->position);
+#endif
   resize_trail (&solver->trail, new_capacity);
 
 #ifndef NQUEUE
@@ -2876,7 +4037,9 @@ increase_capacity (struct satch *solver, unsigned new_capacity)
   assert (!solver->scores[1].begin);
 #endif
 #endif
-
+#ifndef NVIVIFICATION
+  RESIZE_ZERO_INITIALIZED (1, solver->vivify_marks, 0);
+#endif
   solver->capacity = new_capacity;
 }
 
@@ -2887,7 +4050,7 @@ increase_capacity (struct satch *solver, unsigned new_capacity)
 static void
 increase_size (struct satch *solver, unsigned new_size)
 {
-#if !defined(NDEBUG) || defined(NACTIVE)
+#if defined(LOGGING)
   const unsigned old_size = solver->size;
   assert (solver->size < new_size);
 #endif
@@ -2917,11 +4080,37 @@ increase_size (struct satch *solver, unsigned new_size)
   assert (new_size <= solver->capacity);
   LOG ("increase solver size from %u to %u", old_size, new_size);
   solver->size = new_size;
-#ifdef NACTIVE
-  const unsigned delta = new_size - old_size;
-  solver->unassigned += delta;
-  solver->statistics.active += delta;
-#endif
+}
+
+/*------------------------------------------------------------------------*/
+
+// Signed marking of a literal in essence marks variables as negative or
+// positive and is used in checking clauses or resolvents to contain both
+// a positive and a negative occurrence of a literal.
+
+static void
+mark_literal (signed char *marks, unsigned lit)
+{
+  const unsigned idx = INDEX (lit);
+  assert (!marks[idx]);
+  marks[idx] = INT_SIGN (lit);
+}
+
+static signed char
+marked_literal (const signed char *marks, unsigned lit)
+{
+  const unsigned idx = INDEX (lit);
+  signed char res = marks[idx];
+  if (SIGN_BIT (lit))
+    res = -res;
+  return res;
+}
+
+static void
+unmark_literal (signed char *marks, unsigned lit)
+{
+  const unsigned idx = INDEX (lit);
+  marks[idx] = 0;
 }
 
 /*------------------------------------------------------------------------*/
@@ -2943,41 +4132,37 @@ imported_clause_trivial_or_satisfied (struct satch *solver)
   for (const unsigned *p = begin_clause; p != end_clause; p++)
     {
       const unsigned lit = *p;
-      const signed value = values[lit];
+      const signed char value = values[lit];
       if (value < 0)
 	{
-	  LOG ("skipping falsified literal %u", lit);
+	  LOG ("skipping falsified literal %s", LOGLIT (lit));
 	  continue;
 	}
       if (value > 0)
 	{
-	  LOG ("found satisfied literal %u", lit);
+	  LOG ("found satisfied literal %s", LOGLIT (lit));
 	  trivial = true;
 	  break;
 	}
-      const unsigned idx = INDEX (lit);
-      signed char prev = marks[idx];
-      const signed char mark = INT_SIGN (lit);
-      if (mark < 0)
-	prev = -prev;
+      const signed char prev = marked_literal (marks, lit);
       if (prev > 0)
 	{
-	  LOG ("skipping duplicated literal %u", lit);
+	  LOG ("skipping duplicated literal %s", LOGLIT (lit));
 	  continue;
 	}
       if (prev < 0)
 	{
-	  LOG ("clause contains both literal %u and its negation %u",
-	       NOT (lit), lit);
+	  LOG ("clause contains both literal %s and its negation %s",
+	       LOGLIT (NOT (lit)), LOGLIT (lit));
 	  trivial = true;
 	  break;
 	}
       *q++ = lit;
-      marks[idx] = mark;
+      mark_literal (marks, lit);
     }
   solver->clause.end = q;
   for (const unsigned *p = begin_clause; p != q; p++)
-    marks[INDEX (*p)] = 0;
+    unmark_literal (marks, *p);
   return trivial;
 }
 
@@ -3034,20 +4219,36 @@ cache_lines (const void *begin, const void *end)
   return res;
 }
 
+// Short-cut for further usage on stacks.
+
+#define CACHE_LINES_OF_STACK(S) cache_lines ((S)->begin, (S)->end)
+
 /*------------------------------------------------------------------------*/
+
+#ifndef NWATCHES
+
+// ------------------------ //
+// Propagation with watches //
+// ------------------------ //
 
 // Propagating a literal over the clauses in which it occurs negatively,
 // more precisely for which its negation is watched, is the hot-spot of
 // CDCL solving.  This is further pronounced by learning many long clauses.
 
 static struct clause *
-propagate_literal (struct satch *solver, unsigned lit)
+propagate_literal (struct satch *solver, unsigned lit,
+		   struct clause *ignore, uint64_t * ticking)
 {
-  LOG ("propagating %u", lit);
+  LOG ("propagating %s", LOGLIT (lit));
 
   const unsigned not_lit = NOT (lit);
   struct watches *const watches = solver->watches + not_lit;
   signed char *const values = solver->values;
+
+#ifndef NVIVIFICATION
+  if (!solver->vivifying)
+#endif
+    assert (ignore == NULL);
 
   // We traverse all the watches of the literal 'not_lit' and remove those
   // for which we stop watching the clause (since we found a replacement).
@@ -3096,13 +4297,16 @@ propagate_literal (struct satch *solver, unsigned lit)
 	{
 	  if (blocking_value < 0)
 	    {
-	      conflict = binary_clause (solver, not_lit, blocking_lit);
+	      conflict = binary_clause (solver, 0,
+					header.redundant,
+					not_lit, blocking_lit);
 	      LOGCLS (conflict, "conflicting");
 	    }
 	  else if (!blocking_value)
 	    {
 	      assert (!blocking_value);
-	      assign (solver, blocking_lit, binary_reason (not_lit));
+	      assign (solver, blocking_lit,
+		      tag_binary_clause (header.redundant, not_lit), false);
 	      ticks++;
 	    }
 #ifdef NVIRTUAL
@@ -3117,7 +4321,12 @@ propagate_literal (struct satch *solver, unsigned lit)
 
 	{
 	  struct clause *clause = (*q++ = *p++).clause;	// Copy clause.
+	  if (clause->garbage)
+	    LOGCLS (clause, "clause should not be garbage");
 	  assert (!clause->garbage);
+	  if (clause == ignore) {
+	    continue;
+    }
 #ifndef NBLOCK
 	  if (blocking_value > 0)
 	    continue;
@@ -3135,7 +4344,7 @@ propagate_literal (struct satch *solver, unsigned lit)
 	  // literal' idea is to reduce the need for this costly pointer
 	  // dereference as much as possible.
 
-	  ticks++;		// We count these accesses.
+	  ticks++;		// We mainly count these accesses.
 
 	  // The two watched literals of a clause are stored as the first
 	  // two literals but we do not know at which position.  In order to
@@ -3228,7 +4437,7 @@ propagate_literal (struct satch *solver, unsigned lit)
 	      // '1' (if 'NBLOCK' is undefined). This difference is hidden
 	      // in the definition of 'long_clause_watch_size'.
 
-	      LOGCLS (clause, "unwatching %u in", not_lit);
+	      LOGCLS (clause, "unwatching %s in", LOGLIT (not_lit));
 	      q -= long_clause_watch_size;
 
 	      // Swap watched literal with its replacement.
@@ -3236,7 +4445,12 @@ propagate_literal (struct satch *solver, unsigned lit)
 	      literals[1] = replacement;
 	      *r = not_lit;
 
-	      watch_literal (solver, replacement, other, clause);
+#ifndef NBLOCK
+	      const bool redundant = clause->redundant;
+	      watch_literal (solver, redundant, replacement, other, clause);
+#else
+	      watch_literal (solver, replacement, clause);
+#endif
 	      ticks++;
 	    }
 	  else if (other_value)
@@ -3253,13 +4467,13 @@ propagate_literal (struct satch *solver, unsigned lit)
 	      // and thus it is now assigned with this clause as reason.
 
 	      assert (!other_value);
-	      assign (solver, other, clause);
+	      assign (solver, other, clause, false);
 	      ticks++;
 	    }
 	}
     }
 
-  ADD (ticks, ticks);
+  *ticking += ticks;
 
   // After a conflicting clause is found we break out of the propagation but
   // still need to copy the rest of the watches and reset the stack size.
@@ -3271,6 +4485,104 @@ propagate_literal (struct satch *solver, unsigned lit)
   return conflict;
 }
 
+#else // of '#ifndef NWATCHES'
+
+// ------------------------- //
+// Propagation with counters //
+// ------------------------- //
+
+// Updating the non-false literal counters of literals in clauses is the
+// hot-spot for CDCL with counters (instead of watches).  This effort occurs
+// during propagation in this function and then also during backtracking.
+
+struct clause *
+propagate_literal (struct satch *solver, unsigned lit, struct clause *ignore, uint64_t * ticking)
+{
+  LOG ("propagating %s", LOGLIT (lit));
+
+  const unsigned not_lit = NOT (lit);
+  struct watches *const watches = solver->watches + not_lit;
+  signed char *const values = solver->values;
+
+  // We traverse all clauses containing literal 'not_lit' and decrement the
+  // non-false literal counters and update the sum of non-false literals in
+  // order to find a conflict as well as detecting new units.
+
+  uint64_t ticks = 1 + cache_lines (watches->begin, watches->end);
+  struct clause *conflict = 0;
+
+  for (all_elements_on_stack (union watch, watch, *watches))
+    {
+      struct clause * const clause = watch.clause;
+      assert (clause->count > 0);
+      clause->count--;
+      clause->sum -= not_lit;
+      LOGCLS (clause, "count decreased to %u in", clause->count);
+      ticks++;
+      if (clause == ignore)
+        continue;
+      if (conflict)
+	continue;
+      if (!clause->count)
+	{
+	  LOGCLS (clause, "conflicting");
+	  conflict = clause;
+	}
+      else if (clause->count == 1)
+	{
+	  const unsigned unit = clause->sum;
+	  const signed char value = values[unit];
+	  if (!value)
+	    {
+	      assign (solver, unit, clause, false);
+	      ticks++;
+	    }
+	  else if (value  < 0)
+	    {
+	      LOGCLS (clause, "conflicting");
+	      conflict = clause;
+	    }
+	}
+    }
+
+  *ticking += ticks;
+
+  return conflict;
+}
+
+// Without watches and just counters we have to update the counters of
+// propagated literals during backtracking, which we call 'unpropagating'.
+
+static void
+unpropagate_literal (struct satch * solver, unsigned lit)
+{
+  LOG ("unpropagating %s", LOGLIT (lit));
+
+  const unsigned not_lit = NOT (lit);
+  struct watches *const watches = solver->watches + not_lit;
+
+  // We traverse all clauses containing literal 'not_lit' and increment the
+  // non-false literal counters and adjust the non-false literal sum as well.
+
+  uint64_t ticks = 1 + cache_lines (watches->begin, watches->end);
+
+  for (all_elements_on_stack (union watch, watch, *watches))
+    {
+      struct clause * const clause = watch.clause;
+      if (!(clause->count < clause->size))
+	LOGCLS (clause, "wrong counter");
+      assert (clause->count < clause->size);
+      clause->count++;
+      clause->sum += not_lit;
+      LOGCLS (clause, "count increased to %u in", clause->count);
+      ticks++;
+    }
+
+  ADD (ticks, ticks);
+}
+
+#endif
+
 /*------------------------------------------------------------------------*/
 
 // Flush unit clauses from trail after root-level propagation.  Otherwise
@@ -3278,13 +4590,48 @@ propagate_literal (struct satch *solver, unsigned lit)
 // that there are no root-level assigned units on the trail break (for
 // instance in 'reuse_trail').
 
+// For chronological backtracking we flush only the units that are at the
+// beginning of the trail -- this is critical because multiple propagations
+// paths could lead to a unit propagation to not be propagated on level 0.
 static void
 flush_units (struct satch *solver)
 {
+  struct trail *trail = &solver->trail;
+#ifndef NCHRONO
+  assert (trail->propagate >= trail->begin);
+  assert (trail->propagate <= trail->end);
+  unsigned *new_start = trail->begin;
+  while (new_start < trail->end && !solver->levels[INDEX (*new_start)])
+    {
+      ++new_start;
+    }
+  const long int delta = new_start - trail->begin;
+  trail->propagate -= delta;
+  assert (trail->propagate >= trail->begin);
+  LOG ("chrono flushing %zu root-level units on trail", delta);
+  unsigned *lit = trail->begin;
+
+  while (new_start != trail->end)
+    *(lit++) = *(new_start++);
+
+  for (struct level * lvl = solver->control.begin; lvl != solver->control.end;
+       ++lvl)
+    {
+      lvl->trail -= delta;
+      assert (lvl->trail >= trail->begin);
+    }
+  assert (lit <= trail->end);
+  trail->end = lit;
+  assert (trail->propagate >= trail->begin);
+  assert (trail->propagate <= trail->end);
+  assert (SIZE_STACK (solver->control) == solver->level);
+#else
   assert (!solver->level);
-  assert (solver->trail.propagate == solver->trail.end);
+  assert (trail->propagate == trail->end);
   LOG ("flushing %zu root-level units on trail", SIZE_STACK (solver->trail));
-  solver->trail.propagate = solver->trail.end = solver->trail.begin;
+  trail->propagate = trail->end = trail->begin;
+#endif
+
 }
 
 /*------------------------------------------------------------------------*/
@@ -3301,6 +4648,7 @@ flush_units (struct satch *solver)
 static struct clause *
 boolean_constraint_propagation (struct satch *solver)
 {
+  LOG ("BCP");
   struct trail *trail = &solver->trail;
   unsigned *propagate = trail->propagate;
   unsigned *p;
@@ -3309,10 +4657,12 @@ boolean_constraint_propagation (struct satch *solver)
   assert (propagate <= trail->begin + VARIABLES);
 
   struct clause *conflict = 0;
+  uint64_t ticks = 0;
 
   for (p = propagate; !conflict && p != trail->end; p++)
-    conflict = propagate_literal (solver, *p);
+    conflict = propagate_literal (solver, *p, NULL, &ticks);
 
+  ADD (ticks, ticks);
   solver->trail.propagate = p;
   const unsigned propagated = p - propagate;
 
@@ -3320,7 +4670,11 @@ boolean_constraint_propagation (struct satch *solver)
 
   if (conflict)
     INC (conflicts);
-  else if (!solver->level)
+  else if (!solver->level
+#ifndef NCHRONO
+	   || solver->iterate
+#endif
+    )
     flush_units (solver);
 
   return conflict;
@@ -3400,8 +4754,8 @@ update_phases (struct satch *solver)
 
 /*------------------------------------------------------------------------*/
 
-// Backtracking to a certain decision level  in essence just unassigns the
-// literals assigned on higher decision level. Then it reset the decision
+// Backtracking to a certain decision level in essence just unassigns the
+// literals assigned on higher decisn level. Then it reset the decision
 // level and the propagation pointer.
 
 // This procedure is slightly more complicated though since we first need to
@@ -3420,7 +4774,9 @@ backtrack (struct satch *solver, unsigned new_level)
 {
   LOG ("backtracking to level %u", new_level);
   assert (new_level < solver->level);
+#if !defined(NDEBUG) || !defined(NCHRONO) || defined(NCONTROL)
   const unsigned *levels = solver->levels;
+#endif
   signed char *values = solver->values;
 
 #ifndef NQUEUE
@@ -3455,30 +4811,103 @@ backtrack (struct satch *solver, unsigned new_level)
   struct clause *const *const reasons = solver->reasons;
 #endif
 
+#ifdef NWATCHES
+  const unsigned * const propagated = solver->trail.propagate;
+#endif
   struct trail *trail = &solver->trail;
-  while (!EMPTY_STACK (*trail))
+#ifndef NCONTROL
+  unsigned *target_lit = ACCESS (solver->control, new_level).trail;
+  assert (target_lit >= solver->trail.begin);
+  assert (target_lit < solver->trail.end);
+  assert (target_lit <= trail->propagate);
+  unsigned *starting = target_lit;
+
+#endif
+#if !defined(NCHRONO) && !defined(NLOGGING)
+  unsigned *position = solver->position;
+  int starting_position = target_lit - solver->trail.begin;
+  LOG ("backtracking to position %d corresponding", starting_position);
+#endif
+
+#ifndef NCHRONO
+  trail->propagate = target_lit;
+  int reassigned = 0;
+#endif
+
+#ifndef NCONTROL
+  while (target_lit != solver->trail.end)
     {
-      const unsigned lit = TOP (*trail);
+      const unsigned lit = *target_lit;
+#ifdef NWATCHES
+      const unsigned *p = target_lit;
+#endif
+      ++target_lit;
+      const unsigned idx = INDEX (lit);
+      assert (starting <= target_lit);
+#if !defined(NCHRONO) || !defined(NDEBUG)
+      const unsigned lit_level = levels[idx];
+#endif
+#else
+  const unsigned * const begin = trail->begin;
+  unsigned *p = trail->end;
+  while (p != begin)
+    {
+      unsigned * next = p - 1;
+      const unsigned lit = *next;
       const unsigned idx = INDEX (lit);
       const unsigned lit_level = levels[idx];
       if (lit_level == new_level)
 	break;
-
-      (void) POP (*trail);
-      LOG ("unassign %u", lit);
+      p = next;
+#endif
+      LOG ("unassign %s", LOGLIT (lit));
       assert (solver->unassigned < solver->size);
+#ifndef NCHRONO
+      assert (trail->end > starting);
+      assert (starting_position == starting - trail->begin);
+      if (lit_level <= new_level)
+	{
+	  LOG ("keeping literal %s", LOGLIT (lit));
+	  *starting = lit;
+	  position[idx] = starting_position;
+	  ++reassigned;
+	  ++starting;
+	  ++starting_position;
+#ifdef NWATCHES
+	  if (p < propagated)
+	    unpropagate_literal (solver, lit);
+#endif
+	  continue;
+	}
+      LOG ("popping literal %s", LOGLIT (lit));
+#else
+      assert (lit_level > new_level);
+#endif
       solver->unassigned++;
-
       const unsigned not_lit = NOT (lit);
+
+#if !defined(NELIMINATION) && !defined(NLEARN)
       assert (values[lit] > 0);
       assert (values[not_lit] < 0);
+#else
+      // Both Might be flipped in 'extend_solution'.
+      //
+      assert (values[lit]);
+      assert (values[not_lit]);
+#endif
+      assert (values[lit] == -values[not_lit]);
+
       values[lit] = 0;
       values[not_lit] = 0;
+
 #ifdef NLEARN
       struct clause *reason = reasons[idx];
       if (reason &&
+#ifdef NCDCL
+          reason != DUMMY_REASON &&
+#endif
 #ifndef NBLOCK
-	  !is_binary_reason (reason) &&
+	  !is_tagged_clause (reason) &&
 #endif
 	  reason->redundant)
 	(void) delete_clause (solver, reason);
@@ -3495,7 +4924,24 @@ backtrack (struct satch *solver, unsigned new_level)
       if (pos && pos[idx] == INVALID)
 	push_heap (solver, scores, idx);
 #endif
+#ifdef NWATCHES
+      if (p < propagated)
+	unpropagate_literal (solver, lit);
+      else {
+	LOG ("%ld and pos vs propagated %ld", p - propagated, p - trail->propagate);
+      }
+#endif
     }
+
+#ifndef NCONTROL
+  solver->trail.end = starting;
+#ifdef NCHRONO
+  trail->propagate = trail->end;
+#endif
+#else
+  LOG ("p = %s", LOGLIT (*p));
+  trail->end = trail->propagate = p;
+#endif
 #ifndef NQUEUE
   if (queue)
     {
@@ -3503,9 +4949,46 @@ backtrack (struct satch *solver, unsigned new_level)
       queue->search = search;
     }
 #endif
-  solver->trail.propagate = trail->end;
+
+#ifndef NCONTROL
+  solver->control.end = solver->control.begin + new_level;
+  assert (new_level == SIZE_STACK (solver->control));
+#endif
+
+#ifdef DLIS
+  LOG ("backtracking DLIS stack to level %d", new_level);
+  solver->irred_sat_upto.end = solver->irred_sat_upto.begin + new_level;
+  solver->red_sat_upto.end = solver->red_sat_upto.begin + new_level;
+  assert (new_level == SIZE_STACK (solver->irred_sat_upto));
+#endif
+
+#ifndef NCHRONO
+  assert (trail->propagate <= trail->end);
+#endif
   solver->level = new_level;
 }
+
+#if !defined(NREDUCE) || !defined(NELIMINATION) || !defined(NVIVIFICATION)
+
+static void
+update_phases_and_backtrack_to_root_level (struct satch *solver)
+{
+  if (!solver->level)
+    return;
+#ifndef  NTARGET
+  if (solver->stable)
+    update_phases (solver);
+#endif
+  backtrack (solver, 0);
+
+#ifndef NCHRONO
+  const struct clause *conflict = boolean_constraint_propagation (solver);
+  if (conflict)
+    solver->inconsistent = true;
+#endif
+}
+
+#endif
 
 /*------------------------------------------------------------------------*/
 
@@ -3600,85 +5083,216 @@ init_averages (struct satch *solver)
 
 /*------------------------------------------------------------------------*/
 
-// Conflict clause minimization is implemented here.
+#ifndef NSORTDEDUCED
 
-#define SEEN 1			// Literal seen during conflict analysis.
+// Shrinking requires that the temporary learned clause is partitioned into
+// its decision levels.  Each such partition is called a block and we
+// require the blocks to be in descending level order.  It is in general
+// beneficial to sort literals in descending level order in learned clauses
+// too and thus we sort the deduced clause even if shrinking is disabled.
+
+#ifndef NRADIXSORT
+
+#define RANK_LITERAL_BY_INVERSE_LEVEL(LIT)	(~levels[INDEX (LIT)])
+
+static void
+sort_deduced_clause (struct satch *solver)
+{
+  const unsigned *const levels = solver->levels;
+  RSORT (unsigned, unsigned, solver->clause, RANK_LITERAL_BY_INVERSE_LEVEL);
+}
+
+#else
+
+// Without radix sort we need to get the levels from the sorted array and
+// thus have to allocate a temporary array with literals and their levels.
+
+// Since we want stable sorting (to match the radix-sort version) we also
+// add a position argument and thus keep literals in their original order
+// in the clause within one block (literals with the same level).
+
+struct lit_level_pos
+{
+  unsigned lit, level, pos;
+};
+
+static int
+cmp_lit_level_pos (const void *p, const void *q)
+{
+  struct lit_level_pos *l = (struct lit_level_pos *) p;
+  struct lit_level_pos *k = (struct lit_level_pos *) q;
+  if (l->level > k->level)
+    return -1;
+  if (l->level < k->level)
+    return 1;
+  assert (l->pos != k->pos);
+  return l->pos < k->pos ? -1 : 1;
+}
+
+static void
+sort_deduced_clause (struct satch *solver)
+{
+  struct unsigned_stack *clause = &solver->clause;
+  const unsigned size = SIZE_STACK (*clause);
+  const size_t bytes = size * sizeof (struct lit_level_pos);
+  struct lit_level_pos *a = malloc (bytes);
+  if (!a)
+    out_of_memory (bytes);
+  const unsigned *levels = solver->levels;
+  unsigned pos = 0;
+  for (all_elements_on_stack (unsigned, lit, *clause))
+    {
+      struct lit_level_pos *p = a + pos;
+      p->lit = lit;
+      p->level = levels[INDEX (lit)];
+      p->pos = pos++;
+    }
+  qsort (a, size, sizeof *a, cmp_lit_level_pos);
+  const struct lit_level_pos *const end = a + size;
+  unsigned *c = clause->begin;
+  for (const struct lit_level_pos * p = a; p != end; p++)
+    *c++ = p->lit;
+  free (a);
+}
+
+#endif
+
+#endif
+
+/*------------------------------------------------------------------------*/
+
+// The 'ANALYZED' flag is used for 'analyze' but also during minimization.
+
+#define ANALYZED 1		// Literal seen during conflict analysis.
+
+// Conflict clause minimization is implemented here.
 
 #ifndef NMINIMIZE
 
-#define POISONED 2		// Literal can not be minimized.
-#define REMOVABLE 4		// Literal can be be minimized.
+// The following two flags can be set independently of 'ANALYZED' and thus
+// have different bits.  During shrinking we additionally have 'SHRUNKEN'.
 
-static bool
+#define REMOVABLE 2		// Literal can be be minimized.
+#define POISONED 4		// Literal can not be minimized.
+
+static void
+mark_removable (struct satch *solver, unsigned idx)
+{
+  assert (!(solver->marks[idx] & REMOVABLE));
+  solver->marks[idx] |= REMOVABLE;
+  PUSH (solver->removable, idx);
+  LOG ("removable %s", LOGVAR (idx));
+}
+
+static void
+mark_poisoned (struct satch *solver, unsigned idx)
+{
+  assert (!(solver->marks[idx] & POISONED));
+  solver->marks[idx] |= POISONED;
+  PUSH (solver->poisoned, idx);
+  LOG ("poisoned %s", LOGVAR (idx));
+}
+
+// Return either 'REMOVABLE' (literal can be removed) or 'POISONED'.
+
+// This recursive function is guarded against stack-overflow by providing an
+// additional 'depth' parameter, which is increase with each recursive call.
+// If 'depth' hits the 'minimize_depth' limit the procedure conservatively
+// assumes that the literal can not be minimized away.
+
+// Previously computed results are cached in mark flags. Root-level
+// assigned literals are ignored.  The function aborts negatively if a
+// decision variable is reached which has not been marked as being in the
+// clause before (marked 'REMOVABLE') or the decision level of the literal
+// is not in the learned clause.
+
+static int
 minimize_literal (struct satch *solver, unsigned lit, unsigned depth)
 {
   const unsigned idx = INDEX (lit);
   signed char mark = solver->marks[idx];
   assert (mark >= 0);
   if (mark & POISONED)
-    return false;		// Previously shown not to be removable.
+    return POISONED;		// Previously shown not to be removable.
   if (mark & REMOVABLE)
-    return true;		// Previously shown to be removable.
-  if (depth && (mark & SEEN))
-    return true;		// Analyzed thus removable (unless start).
+    return REMOVABLE;		// Previously shown to be removable.
+  if (depth && (mark & ANALYZED))
+    return REMOVABLE;		// Analyzed thus removable (unless start).
+  const unsigned level = solver->levels[idx];
+  if (!level)
+    return REMOVABLE;		// Root-level units can be removed.
   if (depth > minimize_depth)
-    return false;		// Avoids deep recursion (stack overflow).
+    return POISONED;		// Avoids deep recursion (stack overflow).
+#ifndef NCONTROL
+  if (!depth && ACCESS (solver->control, level - 1).seen.count < 2)
+    return POISONED;
+  if (solver->position[idx] <=
+      ACCESS (solver->control, level - 1).seen.earliest)
+    return POISONED;
+#endif
   assert (solver->values[lit] < 0);
   struct clause *reason = solver->reasons[idx];
   if (!reason)
-    return false;		// Decisions can not be removed.
-  const unsigned not_lit = NOT (lit);
-  const unsigned level = solver->levels[idx];
-  if (!level)
-    return true;		// Root-level units can be removed.
+    return POISONED;		// Decisions can not be removed.
   if (!solver->frames[level])
-    return false;		// Decision level not pulled into clause.
+    return POISONED;		// Level not pulled into clause.
+  int res = REMOVABLE;
 #ifndef NBLOCK
-  if (is_binary_reason (reason))
-    reason = binary_reason_to_clause (solver, not_lit, reason);
+  if (is_tagged_clause (reason))
+    reason = untag_clause (solver, 0, NOT (lit), reason);
   else
 #endif
     INC (ticks);
-  LOGCLS (reason, "trying to remove %u at depth %u along", lit, depth);
-  bool res = true;
+  const unsigned not_lit = NOT (lit);
+  LOGCLS (reason, "trying to minimize %s at depth %u along",
+	  LOGLIT (not_lit), depth);
   for (all_literals_in_clause (other, reason))
     {
       if (other == not_lit)
 	continue;
-      if (minimize_literal (solver, other, depth + 1))
+      if (minimize_literal (solver, other, depth + 1) == REMOVABLE)
 	continue;
-      LOG ("could not remove literal %u", other);
-      res = false;
+      res = POISONED;
       break;
     }
   if (depth)
     {
-      mark |= (res ? REMOVABLE : POISONED);
-      solver->marks[idx] = mark;
-      PUSH (solver->marked, idx);
+      if (res == REMOVABLE)
+	mark_removable (solver, idx);
+      else
+	mark_poisoned (solver, idx);
     }
-  LOG ("removing %u at depth %u %s",
-       lit, depth, res ? "succeeded" : "failed");
+  LOG ("%s %s at depth %u",
+       (res == REMOVABLE ? "removable" : "poisoned"), LOGLIT (lit), depth);
   return res;
 }
+
+#ifdef NSHRINK
+
+// Minimize the deduced first unique implication point (1st UIP) clause.
+
+// By default ('NSHRINK' undefined) we employ all-UIP shrinking though which
+// minimizes (in 'minimize_block') each block of literals in the learned
+// clause with the same decision level in the deduced clause separately
+// after shrinking unless shrinking was able to replace the whole block by a
+// single literal.  Thus with shrinking this function becomes obsolete.
 
 static void
 minimize_deduced_clause (struct satch *solver)
 {
-  assert (EMPTY_STACK (solver->marked));
+  assert (EMPTY_STACK (solver->poisoned));
+  assert (EMPTY_STACK (solver->removable));
 
-  const unsigned *const end = solver->clause.end;
-  unsigned *q = solver->clause.begin + 1;
+  unsigned *const end = solver->clause.end;
+  unsigned *const begin = solver->clause.begin;
+  for (unsigned *p = end - 1; p != begin; p--)
+    if (minimize_literal (solver, *p, 0) == REMOVABLE)
+      *p = INVALID;
 
+  unsigned *q = begin, lit;
   for (const unsigned *p = q; p != end; p++)
-    {
-      const unsigned lit = *p;
-      LOG ("trying to minimize literal %u", lit);
-      if (minimize_literal (solver, lit, 0))
-	LOG ("minimized literal %u", lit);
-      else
-	*q++ = lit;
-    }
+    if ((lit = *p) != INVALID)
+      *q++ = lit;
 
   const size_t minimized = end - q;
   solver->clause.end = q;
@@ -3686,49 +5300,332 @@ minimize_deduced_clause (struct satch *solver)
   LOG ("minimized %zu literals", minimized);
   ADD (minimized, minimized);
 
-  for (all_elements_on_stack (unsigned, idx, solver->marked))
-      solver->marks[idx] &= SEEN;
+  LOGTMP ("minimized");
+}
 
-  CLEAR_STACK (solver->marked);
+#endif
+
+// Reset the 'POISONED' and 'REMOVABLE' flags set during minimization.
+
+static void
+reset_removable_and_poisoned (struct satch *solver)
+{
+  for (all_elements_on_stack (unsigned, idx, solver->poisoned))
+      solver->marks[idx] &= ~POISONED;
+  CLEAR_STACK (solver->poisoned);
+
+  for (all_elements_on_stack (unsigned, idx, solver->removable))
+      solver->marks[idx] &= ~REMOVABLE;
+  CLEAR_STACK (solver->removable);
 }
 
 #endif
 
 /*------------------------------------------------------------------------*/
 
-// Mark a literal as 'SEEN' if it has not been visited yet during conflict
-// analysis (or during reason-side-bumping).  Since the 'analyze' function
-// below needs the assignment level of the literal to mark decision levels
-// and decide whether the literal is added to the learned clause we use that
-// level as return value or 'INVALID' as result if the literal has been
-// marked before (or has been assigned on the root-level zero).
+// Mark a literal as 'ANALYZED' if it has not been visited yet during
+// conflict analysis (or during reason-side-bumping).  Since the 'analyze'
+// function below needs the assignment level of the literal to mark decision
+// levels and decide whether the literal is added to the learned clause we
+// use that level as return value or 'INVALID' as result if the literal has
+// been marked before (or has been assigned on the root-level zero).
 
-// The additional pointer arguments are available through 'solver', but we
-// pass them explicitly to make sure that the compiler knows that these
-// fields of the solver did not change (as kind of manual alias analysis).
-
-static inline unsigned
-analyze_literal (struct satch *solver, const unsigned *const levels,
-		 signed char *const marks, unsigned lit)
+static void
+mark_analyzed (struct satch *solver, unsigned idx)
 {
-  const unsigned idx = INDEX (lit);
-  const unsigned lit_level = levels[idx];
-  if (!lit_level)
-    return INVALID;
-  const signed char mark = marks[idx];
-  assert (!mark || mark == SEEN);
-  if (mark)
-    return INVALID;
-  marks[idx] = SEEN;
+  assert (!(solver->marks[idx] & ANALYZED));
+  solver->marks[idx] |= ANALYZED;
   struct analyzed analyzed;
   analyzed.idx = idx;
-#ifndef NSORT
+#ifndef NSORTANALYZED
   analyzed.stamp = INVALID;
 #endif
-  PUSH (solver->seen, analyzed);
-  LOG ("analyzing literal %u", lit);
+  PUSH (solver->analyzed, analyzed);
+  LOG ("analyzed %s", LOGVAR (idx));
+}
+
+static inline unsigned
+analyze_literal (struct satch *solver, unsigned lit)
+{
+  const unsigned idx = INDEX (lit);
+  const unsigned lit_level = solver->levels[idx];
+  if (!lit_level)
+    return INVALID;
+  if (solver->marks[idx])
+    return INVALID;
+  mark_analyzed (solver, idx);
   return lit_level;
 }
+
+/*------------------------------------------------------------------------*/
+
+// More thorough shrinking than classical clause minimization by trying to
+// find unique implication points on all previous decision levels without
+// introducing new decision levels into the learned clause.
+
+#ifndef NSHRINK
+
+// Mark-bit different from 'ANALYZED', 'REMOVABLE', and 'POISONED'.
+
+#define SHRUNKEN 8
+
+static void
+mark_shrunken (struct satch *solver, unsigned idx)
+{
+  assert (!(solver->marks[idx] & SHRUNKEN));
+  solver->marks[idx] |= SHRUNKEN;
+  PUSH (solver->shrunken, idx);
+  LOG ("shrunken %s", LOGVAR (idx));
+}
+
+// Reset literals marked 'SHRUNKEN' in any case (successful or unsuccessful).
+
+static void
+reset_shrunken (struct satch *solver)
+{
+  LOG ("resetting %zu shrunken variables", SIZE_STACK (solver->shrunken));
+  signed char *marks = solver->marks;
+  for (all_elements_on_stack (unsigned, idx, solver->shrunken))
+      marks[idx] &= ~SHRUNKEN;
+  CLEAR_STACK (solver->shrunken);
+}
+
+// Positive case: literals can be shrunken to one unique implication point.
+
+static void
+mark_shrunken_as_removable (struct satch *solver)
+{
+  signed char *marks = solver->marks;
+  for (all_elements_on_stack (unsigned, idx, solver->shrunken))
+    if (!(marks[idx] & REMOVABLE))
+        mark_removable (solver, idx);
+}
+
+// Return '0' if literal is removable or has already been shrunken. Return
+// '-1' if it can definitely not be shrunken, and '1' if it can in principle
+// be shrunken and thus has been marked as such.
+
+// The encoding of these result values has the idea that it matches the
+// number of new additionally marked literals by which 'open' is increased
+// in 'shrink_block' except that if '-1' is returned the search is aborted.
+
+// On lower decision level than the given level of the considered block we
+// use 'minimize_literal' which tries to resolve the literal away based on
+// other literals already in the (partially) minimized and shrunken clause.
+
+static int
+shrink_literal (struct satch *solver, unsigned block_level, unsigned lit)
+{
+  const unsigned idx = INDEX (lit);
+  const unsigned lit_level = solver->levels[idx];
+  if (!lit_level)
+    return 0;
+  if (solver->marks[idx] & SHRUNKEN)
+    return 0;
+  if (lit_level < block_level)
+    return (minimize_literal (solver, lit, 1) == REMOVABLE) ? 0 : -1;
+  mark_shrunken (solver, idx);
+  return 1;
+}
+
+// In case 'shrink_block' is successful it calls this function and shrinks
+// the literals in the clause from 'begin' to 'end' to the given unique
+// implication point and further resets the shrunken literals.
+
+static void
+shrunken_block (struct satch *solver,
+		unsigned *begin, unsigned *end, unsigned uip)
+{
+  for (unsigned *p = begin; p != end; p++)
+    *p = INVALID;
+  *begin = NOT (uip);
+  const unsigned idx = INDEX (uip);
+  if (!(solver->marks[idx] & ANALYZED))
+    mark_analyzed (solver, idx);
+#ifndef NCONTROL
+  const unsigned level = solver->levels[idx];
+  if (level != 0)
+    {
+      struct level *saved = &ACCESS (solver->control, level - 1);
+      if (saved->seen.earliest > solver->position[idx])
+	saved->seen.earliest = solver->position[idx];
+      ++saved->seen.count;
+      LOG ("updating level %d with: %d %d", level, saved->seen.earliest,
+	   saved->seen.count);
+    }
+#endif
+  mark_shrunken_as_removable (solver);
+  reset_shrunken (solver);
+}
+
+// Get start of the level-block ending right before 'end' in the temporary
+// clause which is assumed to be sorted by decreasing decision levels.
+
+static unsigned *
+next_block (struct satch *solver, unsigned *end)
+{
+  const unsigned *const levels = solver->levels;
+  unsigned block_level = INVALID;
+  unsigned *begin = end;
+  while (solver->clause.begin < begin)
+    {
+      const unsigned lit = begin[-1];
+      const unsigned idx = INDEX (lit);
+      const unsigned lit_level = levels[idx];
+      if (lit_level > block_level)
+	break;
+      block_level = lit_level;
+      begin--;
+    }
+  return begin;
+}
+
+// Find a first unique implication point of the given block of literals with
+// the same decision level in the deduced clause.
+
+static bool
+shrink_block (struct satch *solver, unsigned *begin, unsigned *end)
+{
+  assert (begin < end);
+  unsigned open = end - begin;
+  if (open < 2)
+    return true;		// Already shrunken so avoid 'minimize_block'.
+
+  const unsigned block_level = solver->levels[INDEX (*begin)];
+  LOG ("trying to shrink block of size %u at level %u", open, block_level);
+
+  // First mark all literals in the block as 'SHRUNKEN' and also compute
+  // the maximum trail position of the literals in this block.
+
+  unsigned trail = 0;
+  {
+    const unsigned *const position = solver->position;
+    assert (EMPTY_STACK (solver->shrunken));
+    for (unsigned *p = begin; p != end; p++)
+      {
+	const unsigned lit = *p;
+	const unsigned idx = INDEX (lit);
+	mark_shrunken (solver, idx);
+
+	const unsigned pos = position[idx];
+	assert (solver->trail.begin[pos] == NOT (lit));
+	if (pos > trail)
+	  trail = pos;
+      }
+    assert (SIZE_STACK (solver->shrunken) == open);
+  }
+
+  // Now we can start traversing the trail for this block going backward
+  // from the last its literal on the trail.  This traversal follows a
+  // topological order, i.e., an inverse assignment order, and is similar to
+  // the trail traversal in 'analyze' which deduces the learned clause in
+  // the first place.  This order allows us to properly maintain 'open', the
+  // number of literals marked 'SHRUNKEN' and not yet resolved.  If this
+  // number drops to one we have found a unique implication point for this
+  // block.  An alternative to this linear traversal along the trail is
+  // to use a binary heap (we actually tried a radix heap) or some clever
+  // depth first search. The latter however would need to be aborted early
+  // if a literal can not be shrunken and probably is more complicated.
+
+  const unsigned *t = solver->trail.begin + trail;
+  unsigned uip = INVALID;
+  bool failed = false;
+
+  const signed char *const marks = solver->marks;
+  struct clause *const *const reasons = solver->reasons;
+
+  while (!failed)
+    {
+      unsigned idx;
+      do
+	assert (t >= solver->trail.begin), uip = *t--;
+      while (!(marks[idx = INDEX (uip)] & SHRUNKEN));
+      if (!--open)
+	break;
+      struct clause *reason = reasons[idx];
+      assert (reason);
+#ifndef NBLOCK
+      if (is_tagged_clause (reason))
+	reason = untag_clause (solver, 0, uip, reason);
+      else
+#endif
+	INC (ticks);
+      LOGCLS (reason, "trying to shrink %s along", LOGLIT (uip));
+      for (all_literals_in_clause (lit, reason))
+	if (lit != uip)
+	  {
+	    int tmp = shrink_literal (solver, block_level, lit);
+	    if ((failed = (tmp < 0)))
+	      break;
+	    open += (tmp > 0);
+	  }
+    }
+
+  if (failed)
+    reset_shrunken (solver);
+  else
+    shrunken_block (solver, begin, end, uip);
+
+  LOG ("shrinking of block of size %zu at level %u %s",
+       (size_t) (end - begin), block_level, failed ? "failed" : "succeeded");
+
+  return !failed;
+}
+
+// Minimize the block if it could not be shrunken.
+
+static void
+minimize_block (struct satch *solver, unsigned *begin, unsigned *end)
+{
+  unsigned minimized = 0;
+  for (unsigned *p = begin; p != end; p++)
+    if (minimize_literal (solver, *p, 0) == REMOVABLE)
+      *p = INVALID, minimized++;
+  ADD (minimized, minimized);
+  LOG ("minimized %u literals", minimized);
+}
+
+// This is the main shrinking function.  It requires the temporary clause to
+// be sorted with respect to decreasing decision level of its literals (thus
+// 'sort_deduced_clause' has to be called first).
+
+static void
+shrink_deduced_clause (struct satch *solver)
+{
+  assert (EMPTY_STACK (solver->poisoned));
+  assert (EMPTY_STACK (solver->removable));
+
+  {
+    unsigned *end = solver->clause.end;
+    while (end != solver->clause.begin)
+      {
+	unsigned *begin = next_block (solver, end);
+	if (!shrink_block (solver, begin, end))
+	  minimize_block (solver, begin, end);
+	end = begin;
+      }
+  }
+
+  // Removed literals of each block are overwritten with 'INVALID' in place
+  // and in a last pass we have to flush these invalid literals.
+
+  {
+    const unsigned *const end = solver->clause.end;
+    unsigned *q = solver->clause.begin, lit;
+    for (const unsigned *p = q; p != end; p++)
+      if ((lit = *p) != INVALID)
+	*q++ = lit;
+
+    const unsigned shrunken = end - q;
+    solver->clause.end = q;
+    LOG ("shrunken %u literals", shrunken);
+    ADD (shrunken, shrunken);
+  }
+
+  LOGTMP ("shrunken");
+}
+
+#endif
 
 /*------------------------------------------------------------------------*/
 
@@ -3739,31 +5636,29 @@ analyze_literal (struct satch *solver, const unsigned *const levels,
 // mode really needs this technique in order to be effective (and the same
 // applies to rephasing to best-phases and probably rephasing in general).
 
-#ifndef NREASONS
+#ifndef NBUMPREASONS
 
 static inline void
-bump_reason_side_literals (struct satch *solver,
-			   struct clause *const *const reasons,
-			   const unsigned *const levels,
-			   signed char *const marks)
+bump_reason_side_literals (struct satch *solver)
 {
   struct averages *a = averages (solver);
   if (unbiased_slow_average (a, a->decision_rate) >=
       bump_reason_decision_rate_limit)
     return;
 
+  struct clause *const *const reasons = solver->reasons;
   for (all_elements_on_stack (unsigned, lit, solver->clause))
     {
       const unsigned idx = INDEX (lit);
       struct clause *reason = reasons[idx];
 #ifndef NBLOCK
-      if (is_binary_reason (reason))
-	reason = binary_reason_to_clause (solver, NOT (lit), reason);
+      if (is_tagged_clause (reason))
+	reason = untag_clause (solver, 0, NOT (lit), reason);
 #endif
       if (!reason)
 	continue;
       for (all_literals_in_clause (other, reason))
-	if (analyze_literal (solver, levels, marks, other) != INVALID)
+	if (analyze_literal (solver, other) != INVALID)
 	  INC (reasons);
     }
 }
@@ -3777,27 +5672,27 @@ bump_reason_side_literals (struct satch *solver,
 // the same relative order on the queue after bumping which empirically
 // improves the effectiveness of the decision heuristic (less conflicts).
 
-#ifndef NSORT
+#ifndef NSORTANALYZED
 
-// The enqueue time stamps could be added to the 'seen' stack while pushing
-// variable indices to it.  This makes that code more complex given all the
-// different ways of disabling and enabling VMTF and sorting.  Instead we
-// simply put this here to keep that complexity out of 'analyze'.
+// The enqueue time stamps could be added to the 'analyzed' stack while
+// pushing variable indices to it.  This makes that code more complex given
+// all the different ways of disabling and enabling VMTF and sorting.
+// Instead we simply put this here to keep that complexity out of 'analyze'.
 
 static void
 add_stamps (struct satch *solver)
 {
   struct queue *queue = get_queue (solver);
   const struct link *const links = queue->links;
-  const struct analyzed *const end = solver->seen.end;
-  struct analyzed *const begin = solver->seen.begin;
+  const struct analyzed *const end = solver->analyzed.end;
+  struct analyzed *const begin = solver->analyzed.begin;
   for (struct analyzed * p = begin; p != end; p++)
     p->stamp = links[p->idx].stamp;
 }
 
-#ifndef NRSORT
+#ifndef NRADIXSORT
 
-// Ranking function for radix-sorting the seen variables stack.
+// Ranking function for radix-sorting the analyzed variables stack.
 
 // Without using radix sort the time spent in 'sort_analyzed' can reach 20%
 // of the total running time (including both time spent in focused and
@@ -3829,7 +5724,7 @@ static void
 sort_analyzed (struct satch *solver)
 {
   add_stamps (solver);
-  RSORT (struct analyzed, unsigned, solver->seen, rank_analyzed);
+  RSORT (struct analyzed, unsigned, solver->analyzed, rank_analyzed);
 }
 
 #else
@@ -3849,7 +5744,7 @@ static void
 sort_analyzed (struct satch *solver)
 {
   add_stamps (solver);
-  qsort (solver->seen.begin, SIZE_STACK (solver->seen),
+  qsort (solver->analyzed.begin, SIZE_STACK (solver->analyzed),
 	 sizeof (struct analyzed), cmp_analyzed);
 }
 
@@ -3860,36 +5755,412 @@ sort_analyzed (struct satch *solver)
 
 // The CDCL conflict analysis function.
 
-// First we deduce the first 'unique implication point' (UIP) clause, then
-// minimize and learn it, determine the backjump level, backtrack and
-// assign the 1st UIP literal to the opposite value with the learned clause
-// as reason.  We also update various statistics during the analysis.
+// Find the highest level present in the conflict. Without chronological backtracking this is
+// always the current decision level
+#ifndef NCHRONO
 
+static int
+find_conflict_level (struct satch *solver, struct clause *conflict,
+		     unsigned *forced)
+{
+  assert (!solver->inconsistent);
+
+  (void) *forced;
+  unsigned res = 0;
+  int count = 0;
+  unsigned *lits = conflict->literals;
+  const int size = conflict->size;
+  unsigned *const end = lits + size;
+  unsigned *const begin = lits;
+  for (unsigned *p = begin; p != end; ++p)
+    {
+      LOG ("find conflict: lit %s", LOGLIT (*p));
+      const unsigned idx = INDEX (*p);
+      const unsigned level = solver->levels[idx];
+      if (level > res)
+	{
+	  res = level;
+	  *forced = *p;
+	  count = 1;
+	}
+      else if (level == res)
+	{
+	  count++;
+	}
+    }
+
+  LOG ("%d literals on actual conflict level %d, forced: %s", count, res,
+       forced && *forced != INVALID ? LOGLIT (*forced) : "no");
+
+  // Move the two highest level literals to the front.
+  //
+#ifndef NVIRTUAL
+  if (!is_temporary_binary (solver, conflict))
+#endif
+    {
+      for (unsigned i = 0; i < 2; i++)
+	{
+
+	  const unsigned lit = lits[i];
+
+	  unsigned highest_position = i;
+	  unsigned highest_literal = lit;
+	  const unsigned idx = INDEX (lit);
+	  unsigned highest_level = solver->levels[idx];
+
+	  for (int j = i + 1; j < size; j++)
+	    {
+	      const int other = lits[j];
+	      const unsigned idx_other = INDEX (other);
+	      const unsigned tmp = solver->levels[idx_other];
+	      if (highest_level >= tmp)
+		continue;
+	      highest_literal = other;
+	      highest_position = j;
+	      highest_level = tmp;
+	      if (highest_level == res)
+		break;
+	    }
+
+	  // No unwatched higher assignment level literal.
+	  //
+	  if (highest_position == i)
+	    continue;
+
+#ifndef NWATCHES
+	  if (highest_position > 1)
+	    {
+	      LOGCLS (conflict, "unwatch %d in", lit);
+	      unwatch_literal (solver, lit, conflict);
+	    }
+#endif
+
+	  lits[highest_position] = lit;
+	  lits[i] = highest_literal;
+
+#ifndef NWATCHES
+	  if (highest_position > 1)
+#ifndef NBLOCK
+	    watch_literal (solver, conflict->redundant, highest_literal,
+			   lits[!i], conflict);
+#else
+	    watch_literal (solver, highest_literal, conflict);
+#endif
+#endif
+	}
+    }
+
+
+  // Only if the number of highest level literals in the conflict is one
+  // then we can reuse the conflict clause as driving clause for 'forced'.
+  //
+  if (count != 1)
+    {
+      *forced = UINT32_MAX;
+      LOG ("no forcing literal");
+    }
+
+  return res;
+
+}
+
+#ifndef NHEAP
+unsigned
+reuse_scored_trail_from (struct satch *solver, unsigned asserting_level)
+{
+  unsigned next = max_score_unassigned_variable_on_binary_heap (solver);
+  const double *const scores = solver->scores[solver->stable].score;
+  struct clause *const *const reasons = solver->reasons;
+  struct control const control = solver->control;
+  unsigned *const end = solver->trail.end;
+  const double next_score = scores[next];
+  double decision_score = MAX_SCORE;
+  const unsigned control_position =
+    asserting_level ? asserting_level - 1 : asserting_level;
+  for (unsigned *lit = ACCESS (control, control_position).trail; lit != end;
+       ++lit)
+    {
+      const unsigned idx = INDEX (*lit);
+      const double score = scores[idx];
+      const unsigned level = solver->levels[idx];
+      if (level <= asserting_level)
+	continue;
+      if (decision_score < score || score < next_score)
+	return level - 1;
+      if (!reasons[idx])
+	decision_score = score;
+    }
+  return solver->level - 1;
+}
+#endif
+
+#ifndef NQUEUE
+unsigned
+reuse_stamped_trail_from (struct satch *solver, unsigned asserting_level)
+{
+  unsigned next = max_stamped_unassigned_variable_on_decision_queue (solver);
+  const struct link *const links = solver->queue[solver->stable].links;
+  struct clause *const *const reasons = solver->reasons;
+  struct control const control = solver->control;
+  unsigned *const end = solver->trail.end;
+  const unsigned next_stamp = links[next].stamp;
+  unsigned decision_stamp = UINT_MAX;
+  const unsigned control_position =
+    asserting_level ? asserting_level - 1 : asserting_level;
+  for (unsigned *lit = ACCESS (control, control_position).trail; lit != end;
+       ++lit)
+    {
+      const unsigned idx = INDEX (*lit);
+      const unsigned stamp = links[idx].stamp;
+      const unsigned level = solver->levels[idx];
+      if (level <= asserting_level)
+	continue;
+      if (decision_stamp < stamp || stamp < next_stamp)
+	return level - 1;
+      if (!reasons[idx])
+	decision_stamp = stamp;
+    }
+  return solver->level - 1;
+}
+#endif
+
+#endif
+
+#ifndef NCHRONO
+#define CHRONOLEVELS 100
+#endif
+
+#ifndef NCDCL
+// Determine the level we should jump back to. Without chronological backtracking, this is
+// simply the asserting level. With it, there are three possibilities:
+//    - if backtracking does not make sense (e.g., when vivifying), backjump
+//    - otherwise, we use a restart-like heuristic to determine how much should be reused...
+//    - ...unless all variables have been decided. Then we jump to the lastest level.
+static unsigned
+determine_jump_level (struct satch *solver, unsigned conflict_level,
+		      unsigned *asserting_level)
+{
+  signed char *frames = solver->frames;
+  unsigned jump_level = 0;
+  *asserting_level = 0;
+
+  for (all_elements_on_stack (unsigned, lit_level, solver->blocks))
+    {
+      frames[lit_level] = 0;
+      if (lit_level != conflict_level && *asserting_level < lit_level)
+	*asserting_level = lit_level;
+#ifndef NCONTROL
+      if (lit_level)
+	ACCESS (solver->control, lit_level - 1).seen.count = 0,
+	  ACCESS (solver->control, lit_level - 1).seen.earliest = UINT32_MAX;
+#endif
+    }
+  LOG ("asserting level: %d", *asserting_level);
+
+#ifndef NCHRONO
+  if (solver->level - *asserting_level < CHRONOLEVELS ||
+      solver->level - 1 == *asserting_level
+#ifndef NVIVIFICATION
+      || solver->vivifying
+#endif
+    )
+    {
+      LOG ("normal backjumping");
+      return *asserting_level;
+    }
+  LOG ("backjumping considered too inefficient");
+  if (!solver->unassigned)
+    {
+      jump_level = solver->level - 1;
+      if (*asserting_level != solver->level - 1)
+	{
+	  INC (chrono);
+	  ADD (chronosaved, jump_level - *asserting_level);
+	}
+      return jump_level;
+    }
+#ifndef NCHRONOREUSE
+#ifndef NQUEUE
+  if (!solver->queue[solver->stable].size)
+    return solver->level - 1;
+#endif
+
+#if defined(NHEAP)
+  jump_level = reuse_stamped_trail_from (solver, *asserting_level);
+#elif defined(NQUEUE)
+  jump_level = reuse_scored_trail_from (solver, *asserting_level);
+#else
+  if (solver->stable)
+    {
+      jump_level = reuse_scored_trail_from (solver, *asserting_level);
+    }
+
+  else
+    {
+      jump_level = reuse_stamped_trail_from (solver, *asserting_level);
+    }
+#endif
+#else // NCHRONOREUSE = always backtrack to lastest level
+  jump_level = solver->level - 1;
+#endif
+  assert (jump_level >= *asserting_level);
+  if (*asserting_level != jump_level)
+    {
+      INC (chrono);
+      ADD (chronosaved, jump_level - *asserting_level);
+    }
+
+#else // no backtracking
+  jump_level = *asserting_level;
+#endif
+  return jump_level;
+}
+#endif
+
+#ifdef NCDCL
+static void
+produce_reason_for_checker (struct satch *solver)
+{
+  struct clause *const *const reasons = solver->reasons;
+  for (unsigned *lit = solver->trail.begin; lit != solver->trail.end; ++lit)
+    {
+      const unsigned idx = INDEX (*lit);
+      if (!reasons[idx])
+	{
+	  PUSH (solver->clause, NOT (*lit));
+	}
+    }
+
+  struct averages *a = averages (solver);
+  {
+    double trail_filled = percent (SIZE_STACK (solver->trail),
+				   solver->statistics.remaining);
+    update_slow_average (&a->trail_filled, trail_filled);
+    update_slow_average (&a->conflict_level, solver->level);
+  }
+  {
+    const uint64_t decisions = DECISIONS;
+    const uint64_t delta_decisions = decisions - a->saved_decisions;
+    a->saved_decisions = decisions;
+    update_slow_average (&a->decision_rate, delta_decisions);
+  }
+  update_betas (solver);
+
+  trace_and_check_temporary_addition (solver);
+
+  CLEAR_STACK (solver->clause);
+
+}
+#endif
+
+// First we deduce the 'first unique implication point' (1st UIP) clause,
+// minimize, shrink and learn it, then determine backjump level, backtrack
+// and assign the 1st UIP literal to the opposite value with the learned
+// clause as reason.  We also update various statistics during the analysis.
 static bool
 analyze_conflict (struct satch *solver, struct clause *conflict)
 {
   assert (!solver->inconsistent);
-
   assert (EMPTY_STACK (solver->clause));	// Clause learned.
 
-  const unsigned conflict_level = solver->level;
-  if (!conflict_level)
+  if (!solver->level)
     {
       LOG ("learned empty clause");
+      trace_and_check_empty_addition (solver);
       solver->inconsistent = true;
-      if (solver->proof)
-	add_internal_clause_to_proof (solver);
-#ifndef NDEBUG
-      checker_add_learned_clause (solver->checker);
-#endif
       return false;
     }
 
+#ifdef NCDCL
+  (void) conflict;
+  produce_reason_for_checker (solver);
+#ifndef NCONTROL
+  struct level const *const saved =
+    &ACCESS (solver->control, solver->level - 1);
+  const unsigned uip = *saved->trail;
+  assert (solver->values[uip]);
+  assert (saved->lvl == solver->level);
+#else
+  assert (!EMPTY_STACK (solver->trail));
+  unsigned *uipp = solver->trail.end - 1;
+  while (solver->reasons[INDEX (*uipp)])
+    {
+      assert (uipp > solver->trail.begin);
+      --uipp;
+    }
+  const unsigned uip = *uipp;
+#endif
+#ifndef NTARGET
+  if (solver->stable)
+    update_phases (solver);
+#endif
+  unsigned not_uip = NOT (uip);
+  backtrack (solver, solver->level - 1);
+  LOG ("swapping last decision %s", LOGLIT (uip));
+  assert (!solver->values[uip]);
+  assign (solver, not_uip, DUMMY_REASON, solver->level == 0);
+
+  return true;
+#else
   assert (EMPTY_STACK (solver->blocks));	// Decision levels analyzed.
-  assert (EMPTY_STACK (solver->seen));	// Analyzed literals.
+  assert (EMPTY_STACK (solver->analyzed));	// Analyzed literals.
 
   PUSH (solver->clause, INVALID);	// Reserve room for 1st UIP.
 
+#ifndef NCHRONO
+  unsigned forced = INVALID;
+  unsigned *forcedp = &forced;
+  const unsigned conflict_level =
+    find_conflict_level (solver, conflict, forcedp);
+  if (!conflict_level)
+    {
+      LOG ("learned empty clause");
+      trace_and_check_empty_addition (solver);
+      solver->inconsistent = true;
+      return false;
+    }
+  if (*forcedp != INVALID)
+    {
+      assert (solver->values[*forcedp] < 0);
+#ifndef NBLOCK
+      assert (!is_tagged_clause (conflict));
+#endif
+      LOG ("missed propagation of lit %s from level %d", LOGLIT (*forcedp),
+	   conflict_level);
+      backtrack (solver, conflict_level - 1);
+#ifndef NBLOCK
+      if (is_temporary_binary (solver, conflict) || conflict->size == 2)
+	{
+#ifndef NBLOCK
+	  unsigned other =
+	    *forcedp ^ conflict->literals[0] ^ conflict->literals[1];
+	  struct clause *reason = tag_binary_clause (true, other);
+	  assign (solver, *forcedp, reason, false);
+#else
+	  assign (solver, *forcedp, conflict, false);
+#endif
+	}
+      else
+#endif
+	assign (solver, *forcedp, conflict, false);
+      CLEAR_STACK (solver->blocks);
+      CLEAR_STACK (solver->clause);
+      assert (solver->level == conflict_level - 1);
+      return true;
+    }
+  if (conflict_level < solver->level)
+    {
+      LOG ("conflict was on level %d instead of current level %d",
+	   conflict_level, solver->level);
+      backtrack (solver, conflict_level);
+    }
+  else
+    {
+      LOG ("conflict is on current level");
+    }
+#else
+  const unsigned conflict_level = solver->level;
+#endif
   signed char *const marks = solver->marks;
   const unsigned *const levels = solver->levels;
   struct clause *const *const reasons = solver->reasons;
@@ -3909,9 +6180,10 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
       LOGCLS (reason, "analyzing");
 #ifndef NUSED
 #ifndef NBLOCK
-      if (reason != &solver->binary)
+      if (!is_temporary_binary (solver, reason))
 #endif
 	{
+	  assert (uip == INVALID || solver->values[uip] > 0);
 	  if (!reason->used)
 	    reason->used = 1;
 #ifndef NTIER2
@@ -3925,8 +6197,7 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
 	{
 	  if (lit == uip)
 	    continue;
-	  const unsigned lit_level =
-	    analyze_literal (solver, levels, marks, lit);
+	  const unsigned lit_level = analyze_literal (solver, lit);
 	  if (lit_level == INVALID)
 	    continue;
 	  assert (solver->values[lit] < 0);
@@ -3939,6 +6210,19 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
 		  frames[lit_level] = 1;
 		}
 	      PUSH (solver->clause, lit);
+#ifndef NCONTROL
+	      const unsigned idx = INDEX (lit);
+	      const unsigned level = solver->levels[idx];
+	      if (level != 0)
+		{
+		  struct level *saved = &ACCESS (solver->control, level - 1);
+		  if (saved->seen.earliest > solver->position[idx])
+		    saved->seen.earliest = solver->position[idx];
+		  ++saved->seen.count;
+		  LOG ("updating level %d with: %d %d", level,
+		       saved->seen.earliest, saved->seen.count);
+		}
+#endif
 	    }
 	  else
 	    unresolved_on_current_level++;
@@ -3947,19 +6231,27 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
       do
 	{
 	  assert (solver->trail.begin < t);
+#ifndef NCHRONO
+	  if (solver->levels[INDEX (*--t)] == solver->level)
+	    uip = *t;
+	  else
+	    uip = INVALID;
+#else
 	  uip = *--t;
+#endif
 	}
-      while (!marks[uip_idx = INDEX (uip)]);
+      while (uip == INVALID || !marks[uip_idx = INDEX (uip)]);
+      LOG ("next lit to analyze is %s", LOGLIT (uip));
       if (!--unresolved_on_current_level)
 	break;
       reason = reasons[uip_idx];
 #ifndef NBLOCK
-      if (is_binary_reason (reason))
-	reason = binary_reason_to_clause (solver, uip, reason);
+      if (is_tagged_clause (reason))
+	reason = untag_clause (solver, 0, uip, reason);
 #endif
     }
   assert (uip != INVALID);
-  LOG ("1st unique implication point %u", uip);
+  LOG ("first unique implication point %s (1st UIP)", LOGLIT (uip));
   const unsigned not_uip = NOT (uip);
   ACCESS (solver->clause, 0) = not_uip;
   ADD (ticks, ticks);
@@ -3969,20 +6261,26 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
   ADD (deduced, size);
   assert (size);
 
+#ifndef NSORTDEDUCED
+  sort_deduced_clause (solver);
+#endif
+
 #ifndef NMINIMIZE
+  START_IF_NCHEAP (minishrink);
+#ifndef NSHRINK
+  shrink_deduced_clause (solver);
+#else
   minimize_deduced_clause (solver);
-  LOGTMP ("minimized");
+#endif
+  reset_removable_and_poisoned (solver);
+  STOP_IF_NCHEAP (minishrink);
   size = SIZE_STACK (solver->clause);
 #endif
 
   const unsigned glue = SIZE_STACK (solver->blocks);
-  unsigned jump_level = 0;
-  for (all_elements_on_stack (unsigned, lit_level, solver->blocks))
-    {
-      frames[lit_level] = 0;
-      if (lit_level != conflict_level && jump_level < lit_level)
-	jump_level = lit_level;
-    }
+  unsigned asserting_level = 0;
+  unsigned jump_level =
+    determine_jump_level (solver, conflict_level, &asserting_level);
   CLEAR_STACK (solver->blocks);
 
   {
@@ -4000,7 +6298,7 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
     }
     {
       double trail_filled = percent (SIZE_STACK (solver->trail),
-				     solver->statistics.active);
+				     solver->statistics.remaining);
       update_slow_average (&a->trail_filled, trail_filled);
     }
     update_betas (solver);
@@ -4016,20 +6314,21 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
 	 unbiased_slow_average (a, a->slow_glue));
   }
 
-#ifndef NREASONS
-  bump_reason_side_literals (solver, reasons, levels, marks);
+#ifndef NBUMPREASONS
+  bump_reason_side_literals (solver);
 #endif
 
-#ifndef NSORT
+#ifndef NSORTANALYZED
 #ifndef NVSIDS
   if (!solver->stable)
 #endif
     sort_analyzed (solver);	// Sort analyzed variables on time stamp.
 #endif
 
-  for (all_elements_on_stack (struct analyzed, analyzed, solver->seen))
+  for (all_elements_on_stack (struct analyzed, analyzed, solver->analyzed))
     {
       const unsigned idx = analyzed.idx;
+#if !defined(NVMTF) || !defined(NVSIDS)
 #ifndef NBUMP
       INC (bumped);
 #if defined(NVMTF) || defined(NQUEUE)
@@ -4043,10 +6342,11 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
 	move_variable_to_front (solver, idx);
 #endif
 #endif
+#endif
       assert (marks[idx]);
       marks[idx] = 0;
     }
-  CLEAR_STACK (solver->seen);
+  CLEAR_STACK (solver->analyzed);
 
 #ifndef NVSIDS
 #ifndef NSWITCH
@@ -4054,14 +6354,8 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
 #endif
     bump_score_increment (solver);
 #endif
-  if (solver->proof)
-    add_internal_clause_to_proof (solver);
 
-#ifndef NDEBUG
-  for (all_elements_on_stack (unsigned, lit, solver->clause))
-      checker_add_literal (solver->checker, export_literal (lit));
-  checker_add_learned_clause (solver->checker);
-#endif
+  trace_and_check_temporary_addition (solver);
 
 #ifndef NTARGET
   assert (solver->level);
@@ -4074,9 +6368,11 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
 
   if (size == 1)		// Learned a unit clause.
     {
+#ifdef NCHRONO
       assert (!jump_level);
+#endif
       solver->iterate = true;
-      assign (solver, not_uip, 0);
+      assign (solver, not_uip, 0, true);
     }
 #ifndef NVIRTUAL
   else if (size == 2)
@@ -4084,11 +6380,11 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
       const unsigned other = ACCESS (solver->clause, 1);
       LOGBIN (true, not_uip, other, "learned");
 #ifndef NLEARN
-      new_binary (solver, true);
+      add_new_binary_and_watch_it (solver, true);
 #endif
       ADD (learned, 2);
-      struct clause *reason = binary_reason (other);
-      assign (solver, not_uip, reason);
+      struct clause *reason = tag_binary_clause (true, other);
+      assign (solver, not_uip, reason, false);
     }
 #endif
   else
@@ -4099,13 +6395,14 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
       // First literal at jump-level becomes other watch.  Such a literal
       // has to exist and thus the 'break' below has to be hit.  We further
       // rely on backtracking not to reset the level of unassigned literals.
-
       for (unsigned *p = solver->clause.begin + 1, *q = p;; q++)
 	{
 	  assert (q != solver->clause.end);
-	  const unsigned lit = *q, level = levels[INDEX (lit)];
-	  assert (level <= jump_level);
-	  if (level == jump_level)
+	  const unsigned lit = *q;
+	  unsigned idx = INDEX (lit);
+	  unsigned lit_level = levels[idx];
+	  assert (lit_level <= asserting_level);
+	  if (lit_level == asserting_level)
 	    {
 	      *q = *p;
 	      *p = lit;
@@ -4113,7 +6410,12 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
 	    }
 	}
 
+#ifndef NGLUE
       struct clause *learned = new_redundant_clause (solver, glue);
+#else
+      struct clause *learned = new_redundant_clause (solver);
+#endif
+
 #ifndef NUSED
 #ifndef NTIER2
       if (glue <= tier2_glue_limit)
@@ -4125,21 +6427,26 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
       LOGCLS (learned, "learned");
       ADD (learned, size);
 #ifndef NLEARN
+#ifndef NWATCHES
       watch_clause (solver, learned);
+#else
+      connect_clause (solver, learned);
+      count_clause (solver, learned);
 #endif
-      assign (solver, not_uip, learned);
+#endif
+      assign (solver, not_uip, learned, false);
     }
 
   CLEAR_STACK (solver->clause);
-
   return true;
+#endif
 }
 
 /*------------------------------------------------------------------------*/
 
 #ifndef NQUEUE
 
-static unsigned
+unsigned
 max_stamped_unassigned_variable_on_decision_queue (struct satch *solver)
 {
   struct queue *queue = get_queue (solver);
@@ -4159,8 +6466,8 @@ max_stamped_unassigned_variable_on_decision_queue (struct satch *solver)
     }
   queue->search = idx;		// Cache search position.
 
-  LOG ("maximum stamped unassigned variable %u with stamp %u",
-       idx, links[idx].stamp);
+  LOG ("maximum stamped unassigned %s with stamp %u",
+       LOGVAR (idx), links[idx].stamp);
 
   return idx;
 }
@@ -4168,8 +6475,7 @@ max_stamped_unassigned_variable_on_decision_queue (struct satch *solver)
 #endif
 
 #ifndef NHEAP
-
-static unsigned
+unsigned
 max_score_unassigned_variable_on_binary_heap (struct satch *solver)
 {
   const signed char *const values = solver->values;
@@ -4187,8 +6493,8 @@ max_score_unassigned_variable_on_binary_heap (struct satch *solver)
       pop_heap (solver, scores);
     }
 
-  LOG ("maximum score unassigned variable %u with score %g",
-       idx, scores->score[idx]);
+  LOG ("maximum score unassigned %s with score %g",
+       LOGVAR (idx), scores->score[idx]);
 
   return idx;
 }
@@ -4204,11 +6510,16 @@ max_score_unassigned_variable_on_binary_heap (struct satch *solver)
 // except that the latter is only enabled if bumping is enabled too (thus we
 // can replace 'NHEAP' with 'NVSIDS' and 'NQUEUE' with 'NVMTF' there).
 
+#if !defined(DLIS) || !defined(NSAVE)
+
 static unsigned
 decide_variable (struct satch *solver)
 {
   unsigned idx;
 
+#ifdef DLIS
+  idx = max_score_dlis (solver);
+#else
 #if defined(NHEAP)
   idx = max_stamped_unassigned_variable_on_decision_queue (solver);
 #elif defined(NQUEUE)
@@ -4219,7 +6530,8 @@ decide_variable (struct satch *solver)
   else
     idx = max_stamped_unassigned_variable_on_decision_queue (solver);
 #endif
-  LOG ("decision variable %u", idx);
+#endif
+  LOG ("decision %s", LOGVAR (idx));
 
   return idx;
 }
@@ -4256,9 +6568,10 @@ decide_phase (struct satch *solver, unsigned idx)
   if (!value)
     value = original_phase ();
   LOG ("decision phase %d", (int) value);
-  (void) idx;
+  (void) idx;			// Prevent unused 'idx' warning.
   return value;
 }
+#endif
 
 // Pick a decision variable and phase to which it is assigned as decision
 // literal. Then increase decision level and assign the decision literal.
@@ -4266,22 +6579,56 @@ decide_phase (struct satch *solver, unsigned idx)
 static void
 decide (struct satch *solver)
 {
+#ifdef NWATCHES
+#ifndef NVIVIFICATION
+  if (!solver->vivifying)
+#endif
+    {
+    for (all_irredundant_clauses(clause)) {
+      unsigned count = 0;
+      if (clause->garbage)
+        continue;
+      for (all_literals_in_clause(lit, clause)) {
+	if (solver->values[lit] != -1)
+	  ++count;
+      }
+      assert (count == clause->count);
+    }
+    for (all_redundant_clauses(clause)) {
+      if (clause->garbage)
+        continue;
+      unsigned count = 0;
+      for (all_literals_in_clause(lit, clause)) {
+	if (solver->values[lit] != -1)
+	  ++count;
+      }
+      assert (count == clause->count);
+    }
+  }
+#endif
+  START_IF_NCHEAP (decide);
   INC (decisions);
 
   assert (solver->unassigned);
   assert (!solver->inconsistent);
   assert (solver->level < solver->size);
 
+#ifndef NCHRONO
+  assert (solver->level == SIZE_STACK (solver->control));
+#endif
   solver->level++;
-
+#if defined(DLIS) && defined(NSAVE)
+  const unsigned decision = max_score_dlis (solver);	// actually returns a literal
+#else
   const unsigned idx = decide_variable (solver);
   const int value = decide_phase (solver, idx);
 
   const unsigned lit = LITERAL (idx);
   const unsigned decision = (value < 0 ? NOT (lit) : lit);
-  LOG ("decision literal %u", decision);
-
-  assign (solver, decision, 0);
+  LOG ("decision literal %s", LOGLIT (decision));
+#endif
+  assign (solver, decision, 0, false);
+  STOP_IF_NCHEAP (decide);
 }
 
 /*------------------------------------------------------------------------*/
@@ -4306,7 +6653,7 @@ REPORT_IF_LEARN(redundant, "%" PRIu64) \
 REPORT(trail, "%.0f%%") \
 REPORT(glue, "%.0f") \
 REPORT(irredundant, "%" PRIu64) \
-REPORT(variables, "%u") \
+REPORT(variables, "%" PRIu64) \
 REPORT(remaining, "%.0f%%")
 
 // Need to exclude 'restart' and 'reduce' reports if disabled.
@@ -4344,9 +6691,9 @@ REPORT(remaining, "%.0f%%")
 // *INDENT-ON*
 
 static void
-report (struct satch *solver, int type)
+report (struct satch *solver, unsigned verbose, int type)
 {
-  if (!solver->options.verbose)
+  if (solver->options.verbose < verbose)
     return;
 
   INC (reported);
@@ -4375,8 +6722,8 @@ report (struct satch *solver, int type)
   const double trail = unbiased_slow_average (a, a->trail_filled);
   const double glue = unbiased_slow_average (a, a->slow_glue);
   const uint64_t irredundant = solver->statistics.irredundant;
-  const unsigned variables = solver->statistics.active;
-  double remaining = percent (variables, solver->size);
+  const uint64_t variables = solver->statistics.remaining;
+  double remaining = percent (variables, solver->statistics.variables);
 
   // Start formatting the values in 'line'.
 
@@ -4512,6 +6859,14 @@ report (struct satch *solver, int type)
 	  fputs (BOLD_CODE, stdout);
 	  reset = true;
 	  break;
+	case 's':
+	  fputs (GREEN_CODE, stdout);
+	  reset = true;
+	  break;
+	case 'e':
+	  fputs (BOLD_GREEN_CODE, stdout);
+	  reset = true;
+	  break;
 	case '[':
 	case ']':
 	  fputs (MAGENTA_CODE, stdout);
@@ -4560,7 +6915,7 @@ report (struct satch *solver, int type)
 static void
 iterate (struct satch *solver)
 {
-  report (solver, 'i');
+  report (solver, 1, 'i');
   solver->iterate = false;
 }
 
@@ -4575,6 +6930,34 @@ logn (uint64_t n)
 {
   assert (n);
   const double res = log10 (n + 9);
+  assert (res >= 1);
+  return res;
+}
+
+#endif
+
+#if (!defined(NELIMINATION)) && !defined(NINPROCESSING)
+
+static double
+nlognlogn (uint64_t n)
+{
+  assert (n);
+  const double tmp = log10 (n + 9);
+  assert (tmp >= 1);
+  const double res = n * tmp * tmp;
+  assert (res >= 1);
+  return res;
+}
+#endif
+
+#ifndef NVIVIFICATION
+static double
+nlogn (uint64_t n)
+{
+  assert (n);
+  const double tmp = log10 (n + 9);
+  assert (tmp >= 1);
+  const double res = n * tmp;
   assert (res >= 1);
   return res;
 }
@@ -4598,8 +6981,6 @@ nlognlognlogn (uint64_t n)
 
 #ifndef NREDUCE
 
-#if 1
-
 static double
 ndivlogn (uint64_t n)
 {
@@ -4610,19 +6991,6 @@ ndivlogn (uint64_t n)
   assert (res >= 1);
   return res;
 }
-
-#else
-
-static double
-mysqrt (uint64_t n)
-{
-  assert (n);
-  const double res = sqrt (n);
-  assert (res >= 1);
-  return res;
-}
-
-#endif
 
 #endif
 
@@ -4639,7 +7007,17 @@ quadratic (uint64_t n)
 
 #endif
 
-#if !defined(NREDUCE) || !defined(NREPHASE) || !defined(NSWITCH)
+#if (defined(NELIMINATION) || defined(NINPROCESSING)) && defined (NVIVIFICATION)
+#ifdef NREDUCE
+#ifdef NREPHASE
+#ifdef NSWITCH
+#define NSCALE
+#endif
+#endif
+#endif
+#endif
+
+#ifndef NSCALE
 
 // Use one of the above scaling functions to scale the base interval based
 // on the number of counts given as last argument.  For instance if you want
@@ -4680,6 +7058,9 @@ scale_interval (uint64_t base, double (*scale) (uint64_t), uint64_t count)
 static unsigned
 reuse_stamped_trail (struct satch *solver)
 {
+#ifndef NCHRONO
+  return reuse_stamped_trail_from (solver, 1);
+#else
   unsigned next = max_stamped_unassigned_variable_on_decision_queue (solver);
   const struct link *const links = solver->queue[solver->stable].links;
   struct clause *const *const reasons = solver->reasons;
@@ -4695,6 +7076,7 @@ reuse_stamped_trail (struct satch *solver)
 	decision_stamp = stamp;
     }
   return solver->level;
+#endif
 }
 
 #endif
@@ -4706,6 +7088,9 @@ reuse_stamped_trail (struct satch *solver)
 static unsigned
 reuse_scored_trail (struct satch *solver)
 {
+#ifndef NCHRONO
+  return reuse_scored_trail_from (solver, 1);
+#else
   unsigned next = max_score_unassigned_variable_on_binary_heap (solver);
   const double *const scores = solver->scores[solver->stable].score;
   struct clause *const *const reasons = solver->reasons;
@@ -4721,6 +7106,7 @@ reuse_scored_trail (struct satch *solver)
 	decision_score = score;
     }
   return solver->level;
+#endif
 }
 
 #endif
@@ -4737,15 +7123,26 @@ reuse_trail (struct satch *solver)
   assert (!EMPTY_STACK (solver->trail));
   assert (solver->levels[INDEX (ACCESS (solver->trail, 0))]);
 
-#if defined(NHEAP)
-  res = reuse_stamped_trail (solver);
-#elif defined(NQUEUE)
-  res = reuse_scored_trail (solver);
+#if defined(NVMTF) && defined(NVSIDS)
+  res = 0;
 #else
+#ifdef NREUSESTABLE
   if (solver->stable)
-    res = reuse_scored_trail (solver);
+    res = 0;
   else
-    res = reuse_stamped_trail (solver);
+#endif
+    {
+#if defined(NHEAP)
+      res = reuse_stamped_trail (solver);
+#elif defined(NQUEUE)
+      res = reuse_scored_trail (solver);
+#else
+      if (solver->stable)
+	res = reuse_scored_trail (solver);
+      else
+	res = reuse_stamped_trail (solver);
+#endif
+    }
 #endif
 
   if (res)
@@ -4813,8 +7210,7 @@ restart (struct satch *solver)
   message (solver, 4, "restart", restarts,
 	   "restarting after %" PRIu64 " conflicts (limit %" PRIu64 ")",
 	   CONFLICTS, solver->limits.restart);
-  if (solver->options.verbose > 2)
-    report (solver, 'r');
+  report (solver, 3, 'r');
 
 #ifndef NTARGET
   if (solver->stable)
@@ -4976,7 +7372,7 @@ rephase (struct satch *solver)
       solver->target = 0;
     }
 #endif
-  report (solver, type);
+  report (solver, 1, type);
 }
 
 #endif
@@ -5015,7 +7411,7 @@ set_protect_flag_of_reasons (struct satch *solver, bool protect)
       if (!reason)
 	continue;
 #ifndef NBLOCK
-      if (is_binary_reason (reason))
+      if (is_tagged_clause (reason))
 	continue;
 #endif
       LOGCLS (reason, "%sprotecting", protect ? "" : "un");
@@ -5024,37 +7420,174 @@ set_protect_flag_of_reasons (struct satch *solver, bool protect)
     }
 }
 
+#endif
+
+#if !defined(NREDUCE) || !defined(NELIMINATION)
+
+// Check whether a clause is root-level satisfied, i.e., it contains a
+// literal which is assigned to true on decision-level zero.  Otherwise
+// flush (at least) virtually all root-level falsified literals.  The latter
+// is important for marking flushed literals as new subsume candidates.
+
 static bool
-clause_root_level_satisfied (struct satch *solver, struct clause *c)
+clause_satisfied (struct satch *solver, struct clause *c)
 {
+  assert (!solver->level);
+#ifndef NVIRTUAL
+  assert (!is_tagged_clause (c));
+  assert (!is_temporary_binary (solver, c));
+  assert (!c->protected);
+#endif
+
   const signed char *const values = solver->values;
-  const unsigned *const levels = solver->levels;
+  unsigned num_false = 0;
+
   for (all_literals_in_clause (lit, c))
-    if (values[lit] > 0 && !levels[INDEX (lit)])
-      return true;
+    {
+      const signed char value = values[lit];
+      if (value > 0)
+	return true;
+      if (value < 0)
+	num_false++;
+    }
+
+  if (!num_false)
+    return false;
+
+  LOGCLS (c, "found %u root-level falsified in", num_false);
+
+  assert (EMPTY_STACK (solver->clause));
+  for (all_literals_in_clause (lit, c))
+    if (!values[lit])
+      PUSH (solver->clause, lit);
+
+#ifndef NSUBSUMPTION
+  for (all_elements_on_stack (unsigned, lit, solver->clause))
+      mark_subsume_literal (solver, lit);
+#endif
+
+  if (!solver->dense)
+    {
+      trace_and_check_temporary_addition (solver);
+      trace_and_check_clause_deletion (solver, c);
+
+#ifndef NWATCHES
+      const unsigned *old_lits = c->literals;
+      const unsigned *new_lits = solver->clause.begin;
+
+      // Unwatching might break code where we traverse watchers, which is
+      // currently only the case when called in dense mode from
+      // 'actual_number_of_occurrences' and thus not reached.
+
+      unwatch_literal (solver, old_lits[0], c);
+      unwatch_literal (solver, old_lits[1], c);
+#else
+      for (all_literals_in_clause (lit, c))
+	disconnect_literal (solver, lit, c);
+#endif
+
+      const size_t size = SIZE_STACK (solver->clause);
+      assert (size == c->size - num_false);
+      assert (size >= 2);
+
+      // We can not simply add a new clause since this function is called
+      // while traversing the 'irredundant' or 'redundant' stacks.  Instead
+      // we disconnect and add new watches.  Partially keeping unassigned
+      // watches is possible but needs more complex code (it might also
+      // result in blocking literals not in the clause anymore).
+
+#ifndef NVIRTUAL
+      if (size == 2)
+	{
+	  watch_binary (solver, c->redundant, new_lits[0], new_lits[1]);
+	  watch_binary (solver, c->redundant, new_lits[1], new_lits[0]);
+	  LOGCLS (c, "garbage after flushing %u literals", num_false);
+	  c->garbage = true;
+	}
+      else
+#endif
+	{
+#ifndef NWATCHES
+#ifndef NBLOCK
+	  watch_literal (solver, c->redundant, new_lits[0], new_lits[1], c);
+	  watch_literal (solver, c->redundant, new_lits[1], new_lits[0], c);
+#else
+	  watch_literal (solver, new_lits[0], c);
+	  watch_literal (solver, new_lits[1], c);
+#endif
+#endif
+	  unsigned *p = c->literals;
+	  for (all_elements_on_stack (unsigned, lit, solver->clause))
+	     *p++ = lit;
+
+	  c->size = size;
+#ifndef NGLUE
+	  if (c->redundant && c->size >= c->glue)
+	    c->glue = size - 1;
+#endif
+#ifndef NCACHE
+	  c->search = 0;
+#endif
+#ifdef NWATCHES
+	  connect_clause (solver, c);
+	  count_clause (solver, c);
+#endif
+	  LOGCLS (c, "flushing %u literals yields", num_false);
+	}
+
+      // But there is no need to update clause statistics.
+    }
+
+  CLEAR_STACK (solver->clause);
+
   return false;
 }
 
-// Irredundant clauses are not reduced, but root-level satisfied clauses
-// can be collected during reduction too.  This is only necessary if there
-// are new root-level fixed variables since the last reduction though.
+// This function is called in default sparse mode from 'reduce' only and
+// then (through 'clause_satisfied') also flushes falsified literals.  In
+// dense mode it is only called from 'actual_number_of_occurrences' during
+// variable elimination attempts.  There it only updates 'subsume'
+// candidates if the clause is not garbage but contains falsified literals.
+
+static bool
+mark_garbage_if_satisfied (struct satch *solver, struct clause *c)
+{
+  assert (!solver->level);
+#ifndef NVIRTUAL
+  assert (!is_tagged_clause (c));
+  assert (!is_temporary_binary (solver, c));
+#endif
+  if (c->garbage)
+    return true;
+  if (!clause_satisfied (solver, c))
+    return false;
+  mark_garbage (solver, c, "root-level satisfied");
+  return true;
+}
+
+// Irredundant clauses are not reduced, but marked garbage if they are
+// root-level satisfied clauses and can then be collected during reduction
+// too.  This is only necessary if there are new root-level fixed variables
+// since the last reduction though (and restricted to unprotected clauses).
+
+// We also use this function after variable elimination since we might not
+// have found and marked all the satisfied clauses during elimination.
+
+// For subsumption an important side-effect of this function is to mark
+// unassigned literals in not-satisfied irredundant clauses which contain
+// false literals too as subsumption candidates.
 
 static void
-mark_satisfied_irredundant_clauses_as_garbage (struct satch *solver)
+mark_irredundant_clauses_as_garbage_if_satisfied (struct satch *solver)
 {
+  assert (!solver->level);
   for (all_irredundant_clauses (c))
-    {
-      assert (!c->redundant);
-      assert (!c->garbage);
-      if (c->protected)
-	continue;
-      if (!clause_root_level_satisfied (solver, c))
-	continue;
-      LOGCLS (c, "root-level satisfied thus marked garbage");
-      assert (!c->garbage);
-      c->garbage = true;
-    }
+    (void) mark_garbage_if_satisfied (solver, c);
 }
+
+#endif
+
+#ifndef NREDUCE
 
 // Redundant clauses with large enough glucose level (glue) which have not
 // been used since the last reduction are deletion candidates. If there
@@ -5062,7 +7595,7 @@ mark_satisfied_irredundant_clauses_as_garbage (struct satch *solver)
 // mark clauses as garbage which are root-level satisfied.
 
 static void
-gather_reduce_candidates (struct satch *solver, bool new_fixed_variables,
+gather_reduce_candidates (struct satch *solver, bool new_fixed,
 			  struct clauses *candidates)
 {
   // Reverse order is needed for radix sort to ensure that more recently
@@ -5075,14 +7608,16 @@ gather_reduce_candidates (struct satch *solver, bool new_fixed_variables,
   for (all_redundant_clauses_in_reverse (c))
     {
       assert (c->redundant);
-      assert (!c->garbage);
+      if (c->garbage)
+	continue;
       if (c->protected)
 	continue;
-      if (new_fixed_variables && clause_root_level_satisfied (solver, c))
+      if (new_fixed)
 	{
-	  LOGCLS (c, "root-level satisfied thus marked garbage");
-	  c->garbage = true;
-	  continue;
+	  if (mark_garbage_if_satisfied (solver, c))
+	    continue;
+	  if (c->garbage)
+	    continue;
 	}
 #ifndef NVIRTUAL
       assert (c->size > 2);
@@ -5183,6 +7718,10 @@ flush_garbage_watches (struct satch *solver)
     }
 }
 
+#endif
+
+#if !defined(NREDUCE) || !defined(NELIMINATION)
+
 // After removing garbage watches we can finally delete garbage clauses.
 
 static void
@@ -5213,6 +7752,10 @@ delete_garbage_clauses (struct satch *solver, struct clauses *clauses,
   *count_ptr += count;
 }
 
+#endif
+
+#ifndef NREDUCE
+
 /*------------------------------------------------------------------------*/
 
 // Candidate clauses considered to be reduced are sorted with respect to
@@ -5220,7 +7763,7 @@ delete_garbage_clauses (struct satch *solver, struct clauses *clauses,
 // useful if they have a smaller glue or smaller size with the same glue.
 // If both glue and size are the same we keep more recently learned clauses.
 
-#ifndef NRSORT
+#ifndef NRADIXSORT
 
 #ifndef NGLUE
 
@@ -5315,10 +7858,8 @@ mark_garbage_candidates (struct satch *solver, struct clauses *candidates)
   while (SIZE_STACK (*candidates) > keep)
     {
       struct clause *c = POP (*candidates);
-      LOGCLS (c, "reducing thus marked garbage");
       assert (!c->protected);
-      assert (!c->garbage);
-      c->garbage = true;
+      mark_garbage (solver, c, "reducing");
       reduced++;
     }
 
@@ -5332,34 +7873,95 @@ mark_garbage_candidates (struct satch *solver, struct clauses *candidates)
 
 /*------------------------------------------------------------------------*/
 
+#ifndef NDEBUG
+
+// Even though the 'irredundant' and 'redundant' clause statistics are only
+// used for reporting we still want to accurately measure and maintain them,
+// which unfortunately is not trivial.  These reports are very useful for
+// engineering heuristics (and sometimes debugging).
+
+// Thus we perform this explicit check before and after 'reduce'.
+
+static void
+check_clause_statistics (struct satch *solver)
+{
+  assert (!solver->dense);
+
+  uint64_t irredundant = 0;
+  uint64_t redundant = 0;
+
+#ifndef NVIRTUAL
+  for (all_literals (lit))
+    {
+      const struct watches *const watches = solver->watches + lit;
+      const union watch *const end = watches->end;
+      const union watch *p = watches->begin;
+      while (p != end)
+	{
+	  const union watch watch = *p++;
+	  const struct header header = watch.header;
+	  if (header.binary)
+	    {
+	      const unsigned other = header.blocking;
+	      if (lit < other)
+		{
+		  if (header.redundant)
+		    redundant++;
+		  else
+		    irredundant++;
+		}
+	    }
+	  else
+	    p++;
+	}
+    }
+#endif
+
+  for (all_irredundant_clauses (c))
+    if (!c->garbage)
+      irredundant++;
+
+  for (all_redundant_clauses (c))
+    if (!c->garbage)
+      redundant++;
+
+  assert (irredundant == solver->statistics.irredundant);
+  assert (redundant == solver->statistics.redundant);
+}
+
+#endif
+
+/*------------------------------------------------------------------------*/
+
 // Reduce less useful redundant clauses frequently.
 
 static void
 reduce (struct satch *solver)
 {
+#ifndef NDEBUG
+  check_clause_statistics (solver);
+#endif
   START (reduce);
-
   const uint64_t reductions = INC (reductions);
 
-#ifndef NVIRTUAL
-  assert (solver->statistics.redundant >= SIZE_STACK (solver->redundant));
-  assert (solver->statistics.irredundant >= SIZE_STACK (solver->irredundant));
-#else
-  assert (solver->statistics.redundant == SIZE_STACK (solver->redundant));
-  assert (solver->statistics.irredundant == SIZE_STACK (solver->irredundant));
-#endif
+  // If there are new fixed (root-level assigned) variables since the last
+  // reduction, we remove both satisfied irredundant clauses here and later
+  // satisfied redundant clauses in 'gather_reduce_candidates'.  Both call
+  // 'mark_garbage_if_satisfied' for large clauses, which in turn calls
+  // 'clause_satisfied' and thus also flushes falsified literals.
 
-  // First protect reasons from garbage collection and mark all newly
-  // satisfied clauses as garbage.  This is only necessary if there are
-  // newly fixed (root-level unit) variables since the last reduction, but
-  // then also requires to go over the irredundant clauses.
+  // Without new fixed variable we do not backtrack but protect reasons.
 
-  set_protect_flag_of_reasons (solver, true);
-
-  const bool new_fixed_variables =
+  const bool new_fixed =
     solver->limits.reduce.fixed < solver->statistics.fixed;
-  if (new_fixed_variables)
-    mark_satisfied_irredundant_clauses_as_garbage (solver);
+
+  if (new_fixed)
+    {
+      update_phases_and_backtrack_to_root_level (solver);
+      mark_irredundant_clauses_as_garbage_if_satisfied (solver);
+    }
+  else
+    set_protect_flag_of_reasons (solver, true);
 
   // At the core of reduction is to first gather potential redundant reduce
   // candidate clauses (omitting those that are definitely kept).  Then
@@ -5371,7 +7973,7 @@ reduce (struct satch *solver)
     struct clauses candidates;
     INIT_STACK (candidates);
 
-    gather_reduce_candidates (solver, new_fixed_variables, &candidates);
+    gather_reduce_candidates (solver, new_fixed, &candidates);
     sort_reduce_candidates (&candidates);
     mark_garbage_candidates (solver, &candidates);
 
@@ -5383,33 +7985,15 @@ reduce (struct satch *solver)
 
   flush_garbage_watches (solver);
 
-  // As final step we delete garbage clauses and print statistics.
+  // As next to final step we delete garbage clauses and print statistics.
 
   {
     size_t bytes = 0, count = 0;
-    if (new_fixed_variables)
+    if (new_fixed)
       delete_garbage_clauses (solver, &solver->irredundant, &bytes, &count);
     delete_garbage_clauses (solver, &solver->redundant, &bytes, &count);
 
-    // No we can mark reasons of literals on the trail as unprotected.
-
-    set_protect_flag_of_reasons (solver, false);
-
-    // We then compute and report the next conflict limit for reduction.
-
-    solver->limits.reduce.fixed = solver->statistics.fixed;
-    const uint64_t interval =
-#if 1
-      scale_interval (reduce_interval, ndivlogn, reductions);
-#else
-      scale_interval (reduce_interval, mysqrt, reductions);
-#endif
-    solver->limits.reduce.conflicts = CONFLICTS + interval;
-    message (solver, 4, "reduce", reductions,
-	     "next reduce limit at %" PRIu64 " after %" PRIu64 " conflicts",
-	     solver->limits.reduce.conflicts, interval);
-
-    // Finally we report on how many clauses we collected.
+    // We report on how many clauses we collected during reduction.
 
     message (solver, 2, "reduce", reductions,
 	     "collected %zu clauses (%zu bytes, %.0f MB)",
@@ -5418,8 +8002,28 @@ reduce (struct satch *solver)
     ADD (collected, bytes);
   }
 
-  report (solver, '-');
+  // No we can mark reasons of literals on the trail as unprotected.
+
+  if (!new_fixed)
+    set_protect_flag_of_reasons (solver, false);
+
+  // Finally we compute and report the next conflict limit for reduction.
+
+  {
+    solver->limits.reduce.fixed = solver->statistics.fixed;
+    const uint64_t interval =
+      scale_interval (reduce_interval, ndivlogn, reductions);
+    solver->limits.reduce.conflicts = CONFLICTS + interval;
+    message (solver, 4, "reduce", reductions,
+	     "next limit at %" PRIu64 " after %" PRIu64 " conflicts",
+	     solver->limits.reduce.conflicts, interval);
+  }
+
+  report (solver, 1, '-');
   STOP (reduce);
+#ifndef NDEBUG
+  check_clause_statistics (solver);
+#endif
 }
 
 #endif
@@ -5443,13 +8047,13 @@ start_mode (struct satch *solver)
   if (solver->stable)
     {
       START (stable);
-      report (solver, '[');
+      report (solver, 1, '[');
       LOG ("start stable mode");
     }
   else
     {
       START (focused);
-      report (solver, '{');
+      report (solver, 1, '{');
       LOG ("start focused mode");
     }
 }
@@ -5461,13 +8065,13 @@ stop_mode (struct satch *solver)
     {
       STOP (stable);
       LOG ("stop stable mode");
-      report (solver, ']');
+      report (solver, 1, ']');
     }
   else
     {
       STOP (focused);
       LOG ("stop focused mode");
-      report (solver, '}');
+      report (solver, 1, '}');
     }
 }
 
@@ -5592,10 +8196,3428 @@ switch_mode (struct satch *solver)
 #endif
 
 /*------------------------------------------------------------------------*/
+#ifndef NELIMINATION
+/*------------------------------------------------------------------------*/
+
+static bool
+more_elimination_candidates (struct satch *solver)
+{
+  return solver->statistics.marked_eliminate >
+    solver->limits.eliminate.marked;
+}
+
+#ifndef NSUBSUMPTION
+
+static bool
+more_subsumption_candidates (struct satch *solver)
+{
+  return solver->statistics.marked_subsume > solver->limits.subsume.marked;
+}
+
+#endif
+
+static bool
+eliminating (struct satch *solver)
+{
+#ifdef NCDCL
+  if (solver->level)
+    return false;
+#endif
+  if (!more_elimination_candidates (solver))
+#ifndef NSUBSUMPTION
+    if (!more_subsumption_candidates (solver))
+#endif
+      return false;
+#ifndef NINPROCESSING
+  return solver->limits.eliminate.conflicts < CONFLICTS;
+#else
+  return !solver->statistics.eliminations;
+#endif
+}
+
+/*------------------------------------------------------------------------*/
+
+// The code for switching from sparse to dense mode and back heavily relies
+// on how watches are organized ('NVIRTUAL' or even 'NBLOCK' is defined).
+
+#ifndef NVIRTUAL
+
+// This is the default routine for flushing all redundant watches where we
+// use virtual binary clauses and blocking literals.
+
+// It is the most complex variant because binary clauses reside in watches
+// only and thus the redundant binary clauses have to be saved while the
+// irredundant ones are kept.  The redundant-clause watches are flushed
+// completely, while for the redundant-clause watches we remove the header.
+
+// Furthermore, since in dense mode we only have clause references as watches
+// we need to use the same mechanism as for reasons to store binary clauses
+// (actually only the other literal) through tagged clause pointers.
+
+static void
+flush_redundant_watches (struct satch *solver, bool new_fixed)
+{
+  assert (EMPTY_STACK (solver->binaries));
+  const struct flags *const flags = solver->flags;
+  for (all_literals (lit))
+    {
+      struct watches *watches = solver->watches + lit;
+      const union watch *const end = watches->end;
+      union watch *q = watches->begin, *p = q;
+      const bool lit_active = new_fixed ? true : flags[INDEX (lit)].active;
+      while (p != end)
+	{
+	  struct header header = p->header;
+	  if (header.binary)
+	    {
+	      const unsigned other = header.blocking;
+	      const bool redundant = header.redundant;
+	      const bool other_active =
+		new_fixed ? true : flags[INDEX (other)].active;
+
+	      if (lit_active && other_active)
+		{
+		  if (header.redundant)
+		    {
+		      if (lit < other)
+			{
+			  PUSH (solver->binaries, lit);
+			  PUSH (solver->binaries, other);
+			}
+		    }
+		  else
+		    q++->clause = tag_binary_clause (false, other);
+		}
+	      else
+		delete_binary (solver, redundant, lit, other);
+
+	      p++;
+	    }
+	  else
+	    {
+	      if (!header.redundant)
+		{
+		  struct clause *c = p[1].clause;
+		  if (!new_fixed || !c->garbage)
+		    q++->clause = c;
+		}
+
+	      p += 2;
+	    }
+	}
+      watches->end = q;
+      if (EMPTY_STACK (*watches))
+	RELEASE_STACK (*watches);
+    }
+  LOG ("saved %zu redundant binary clauses",
+       SIZE_STACK (solver->binaries) / 2);
+}
+
+#elif !defined(NBLOCK)
+
+// With blocking literals but without virtual clauses the watches all have
+// both a header and a clause.  We always drop the header (the blocking
+// literal) and in addition flush the reference to redundant clauses.
+
+static void
+flush_redundant_watches (struct satch *solver, bool new_fixed)
+{
+  for (all_literals (lit))
+    {
+      struct watches *watches = solver->watches + lit;
+      const union watch *const end = watches->end;
+      union watch *q = watches->begin;
+      for (const union watch * p = q; p != end; p += 2)
+	if (!p->header.redundant)
+	  {
+	    struct clause *c = p[1].clause;
+	    if (!new_fixed || !c->garbage)
+	      *q++ = p[1];
+	  }
+      watches->end = q;
+      if (EMPTY_STACK (*watches))
+	RELEASE_STACK (*watches);
+    }
+}
+
+#else
+
+// The simplest case without blocking literals (and also without virtual
+// binary clauses) we just flush redundant clauses. This has the same effect
+// as in the previous case (no virtual binary clauses but with blocking
+// literals) and thus when working in dense mode code we only need to
+// distinguish between having virtual binary clauses or not.
+
+static void
+flush_redundant_watches (struct satch *solver, bool new_fixed)
+{
+  for (all_literals (lit))
+    {
+      struct watches *watches = solver->watches + lit;
+      const union watch *const end = watches->end;
+      union watch *q = watches->begin;
+      struct clause *c;
+      for (const union watch * p = q; p != end; p++)
+	if (!(c = p->clause)->redundant && (!new_fixed || !c->garbage))
+	  *q++ = *p;
+      watches->end = q;
+      if (EMPTY_STACK (*watches))
+	RELEASE_STACK (*watches);
+    }
+}
+
+#endif
+
+static void
+connect_occurrences_in_irredundant_clauses (struct satch *solver)
+{
+  assert (solver->dense);
+  for (all_irredundant_clauses (c))
+    {
+      const unsigned *const lits = c->literals;
+      const unsigned *const end = lits + c->size;
+      for (const unsigned *p = lits + 2; p != end; p++)
+       if (!c->garbage)
+         connect_literal (solver, *p, c);
+    }
+}
+
+static void
+switch_to_dense_mode (struct satch *solver)
+{
+  LOG ("switching to dense mode");
+  assert (!solver->dense);
+  bool new_fixed = solver->limits.eliminate.fixed < solver->statistics.fixed;
+  if (new_fixed)
+    mark_irredundant_clauses_as_garbage_if_satisfied (solver);
+  flush_redundant_watches (solver, new_fixed);
+  solver->dense = true;
+  connect_occurrences_in_irredundant_clauses (solver);
+}
+
+/*------------------------------------------------------------------------*/
+
+#ifndef NVIRTUAL
+
+// With virtual binary clauses we need to make sure to keep the irredundant
+// binary clauses in the watcher stacks but otherwise drop all references.
+
+static void
+disconnect_all_clauses (struct satch *solver)
+{
+  assert (solver->dense);
+  const struct flags *const flags = solver->flags;
+  for (all_literals (lit))
+    {
+      struct watches *watches = solver->watches + lit;
+      const union watch *const end = watches->end;
+      union watch *q = watches->begin;
+      struct clause *c;
+      bool lit_eliminated = flags[INDEX (lit)].eliminated;
+      for (const union watch * p = q; p != end; p++)
+	if (is_tagged_clause (c = p->clause))
+	  {
+	    const unsigned other = tagged_clause_to_literal (c);
+	    const bool other_eliminated = flags[INDEX (other)].eliminated;
+	    if (!lit_eliminated && !other_eliminated)
+	      {
+		union watch watch;
+		watch.header.binary = true;
+		watch.header.redundant = false;
+		watch.header.blocking = other;
+		*q++ = watch;
+	      }
+	    else
+	      delete_binary (solver, false, lit, other);
+	  }
+      watches->end = q;
+    }
+}
+
+#else
+
+static void
+disconnect_all_clauses (struct satch *solver)
+{
+  assert (solver->dense);
+  for (all_literals (lit))
+    CLEAR_STACK (solver->watches[lit]);
+}
+
+#endif
+
+#ifndef NVIRTUAL
+
+static void
+watch_saved_redundant_binaries (struct satch *solver)
+{
+  const unsigned *begin = solver->binaries.begin;
+  const unsigned *end = solver->binaries.end;
+  const struct flags *const flags = solver->flags;
+  for (const unsigned *p = begin; p != end; p += 2)
+    {
+      const unsigned i[2] = { INDEX (p[0]), INDEX (p[1]) };
+      const struct flags f[2] = { flags[i[0]], flags[i[1]] };
+      const bool eliminated[2] = { f[0].eliminated, f[1].eliminated };
+      if (!eliminated[0] && !eliminated[1])
+	{
+	  watch_binary (solver, true, p[0], p[1]);
+	  watch_binary (solver, true, p[1], p[0]);
+	}
+      else
+	delete_binary (solver, true, p[0], p[1]);
+    }
+  CLEAR_STACK (solver->binaries);
+}
+
+#endif
+
+static void
+watch_clauses (struct satch *solver, struct clauses *clauses)
+{
+  for (all_pointers_on_stack (struct clause, c, *clauses))
+      watch_clause (solver, c);
+}
+
+static void
+switch_to_sparse_mode (struct satch *solver)
+{
+  LOG ("switching back to sparse mode");
+  assert (solver->dense);
+  disconnect_all_clauses (solver);
+  solver->dense = false;
+#ifndef NVIRTUAL
+  watch_saved_redundant_binaries (solver);
+#endif
+  watch_clauses (solver, &solver->irredundant);
+  watch_clauses (solver, &solver->redundant);
+}
+
+/*------------------------------------------------------------------------*/
+
+// Check whether a (redundant) clause contains an eliminated literal.
+
+static bool
+clause_eliminated (struct satch *solver, struct clause *c)
+{
+  assert (c->redundant);	// Coincidentally.
+  assert (!solver->level);
+  const struct flags *const flags = solver->flags;
+  for (all_literals_in_clause (lit, c))
+    if (flags[INDEX (lit)].eliminated)
+      return true;
+  return false;
+}
+
+static void
+mark_satisfied_eliminated_redundant_clauses_garbage (struct satch *solver)
+{
+  for (all_redundant_clauses (c))
+    if (!c->garbage)
+      {
+	if (clause_eliminated (solver, c))
+	  mark_garbage (solver, c, "eliminated");
+	else if (clause_satisfied (solver, c))
+	  mark_garbage (solver, c, "root-level satisfied");
+      }
+}
+
+// The irredundant eliminated clauses have been marked explicitly already
+// but we still need to mark redundant clauses with eliminated variables.
+
+static void
+mark_and_collect_garbage_clauses_after_elimination (struct satch *solver)
+{
+  assert (solver->dense);	// No flushing in 'clause_satisfied'!
+
+  if (solver->limits.eliminate.fixed < solver->statistics.fixed)
+    mark_irredundant_clauses_as_garbage_if_satisfied (solver);
+
+  mark_satisfied_eliminated_redundant_clauses_garbage (solver);
+
+  {
+    size_t bytes = 0, count = 0;
+    delete_garbage_clauses (solver, &solver->irredundant, &bytes, &count);
+    delete_garbage_clauses (solver, &solver->redundant, &bytes, &count);
+
+    // We report on how many clauses we collected during elimination.
+
+    message (solver, 2, "elimination", solver->statistics.eliminations,
+	     "collected %zu clauses (%zu bytes, %.0f MB)",
+	     count, bytes, bytes / (double) (1u << 20));
+
+    ADD (collected, bytes);
+  }
+}
+
+/*------------------------------------------------------------------------*/
+
+#ifndef NSUBSUMPTION
+
+// Assume 'size' literals have been marked.  Then try to find a clause
+// different from 'skip' in which the literal 'lit' occurs and has all the
+// marked literals.  This clause is then subsumed and marked garbage.  We also
+// perform strengthening through self-subsuming resolution, which removes
+// individual literals from clauses which are almost subsumed except for one
+// literal which occurs negated.
+
+// The clause literal 'traversed' denotes a literal whose watches are
+// currently traversed (the 'lit' in 'backward_subsume_literal').  If we
+// modify its watches we have to abort that traversals since iterators
+// (pointers into the stack) become invalid.
+
+static bool
+backward_subsume_marked (struct satch *solver,
+			 unsigned size, unsigned lit,
+			 struct clause *skip, unsigned traversed)
+{
+#ifdef NSTRENGTHENING
+  (void) traversed;
+#endif
+  assert (solver->flags[INDEX (lit)].active);
+
+  struct watches *const watches = solver->watches + lit;
+  const signed char *const values = solver->values;
+  const signed char *const marks = solver->marks;
+
+  bool touched = false;		// Traversed literal watches touched.
+
+  assert (!solver->level);
+
+  uint64_t ticks = 1 + CACHE_LINES_OF_STACK (watches);
+
+  ADD (subsumption_ticks, ticks);
+
+  const union watch *const end_of_watches = watches->end, *p;
+  union watch *q = watches->begin;
+
+  for (p = q; p != end_of_watches; p++)
+    {
+      const union watch watch = *q++ = *p;
+#ifdef NVIRTUAL
+      if (solver->inconsistent)
+	continue;
+#endif
+      struct clause *c = watch.clause;
+      if (c == skip)
+	continue;
+
+#ifndef NVIRTUAL
+      if (is_tagged_clause (c))
+	{
+	  // We use 'remove_duplicated_virtual_binary_clauses' instead.
+	  continue;
+	}
+      else
+#endif
+	{
+	  ticks++;
+	  if (c->garbage)
+	    continue;
+	}
+
+      if (c->size < size)
+	continue;
+
+      bool satisfied = false;	// Clause actually satisfied.
+      unsigned clashed = 0;	// How many clashing literals.
+      unsigned found = 0;	// How many literals found.
+#ifndef NSTRENGTHENING
+      unsigned clashing = INVALID;	// The last clashing literal.
+#endif
+      for (all_literals_in_clause (other, c))
+	{
+	  const signed char value = values[other];
+	  if (value > 0)
+	    {
+	      satisfied = true;
+	      break;
+	    }
+	  if (value < 0)
+	    continue;
+	  const signed char mark = marked_literal (marks, other);
+	  if (!mark)
+	    continue;
+	  if (mark < 0)
+	    {
+#ifndef NSTRENGTHENING
+	      if (clashed++)
+		break;
+	      clashing = other;
+#else
+	      clashed = 1;
+	      break;
+#endif
+	    }
+	  else
+	    assert (mark > 0);
+	  found++;
+	}
+
+#ifndef NSTRENGTHENING
+      if (clashed > 1)
+	continue;
+#else
+      if (clashed)
+	continue;
+#endif
+      if (satisfied)
+	{
+	  mark_garbage (solver, c, "root-level satisfied");
+	  continue;
+	}
+
+      if (found < size)
+	continue;
+
+      assert (found == size);
+
+#ifndef NSTRENGTHENING		// Begin of strengthening code.
+
+      if (clashed)
+	{
+#ifndef NSUBSUMPTIONLIMITS
+	  {
+	    const size_t occs = SIZE_STACK (solver->watches[clashing]);
+	    if (occs >= strengthening_occurrence_limit)
+	      continue;
+	  }
+#endif
+	  assert (clashed == 1);
+	  assert (clashing != INVALID);
+	  LOGCLS (c, "single clashing literal %s", LOGLIT (clashing));
+
+	  // The negation of this assertion as a coverage hole was never
+	  // triggered, It could be accommodated by setting 'touched = true'
+	  // in this case, but as it never happens we added this assertion.
+
+	  assert (clashing != traversed);
+
+#ifdef NVIRTUAL
+	  unsigned unit = INVALID;
+	  if (c->size == 2)
+	    {
+	      for (all_literals_in_clause (other, c))
+		if (other != clashing)
+		  assert (unit == INVALID), unit = other;
+	      assert (unit != INVALID);
+
+	      const signed char value = solver->values[unit];
+	      assert (value <= 0);
+	      if (value < 0)
+		{
+		  trace_and_check_empty_addition (solver);
+		  LOG ("inconsistent unit %s resolved", LOGLIT (unit));
+		  solver->inconsistent = true;
+		  touched = true;
+		  continue;
+		}
+	    }
+#endif
+	  trace_and_check_clause_addition (solver, c, clashing);
+	  trace_and_check_clause_deletion (solver, c);
+
+	  mark_eliminate_literal (solver, clashing);
+#ifdef NVIRTUAL
+	  if (c->size == 2)
+	    {
+	      LOG ("resolved unit %s", LOGLIT (unit));
+	      assert (unit != INVALID);
+	      assert (!solver->values[unit]);
+	      assign (solver, unit, 0, false);
+	    }
+	  else
+#endif
+	    {
+	      assert (c->size > 2);
+	      if (lit == clashing)
+		{
+		  LOGCLS (c, "disconnecting %s from", LOGLIT (lit));
+		  q--;
+		}
+	      else
+		{
+		  ticks++;
+		  disconnect_literal (solver, clashing, c);
+		}
+
+	      for (all_literals_in_clause (other, c))
+		if (other != clashing)
+		  mark_subsume_literal (solver, other);
+	    }
+
+#ifndef NVIRTUAL
+
+	  // Ternary clauses become virtual binary clauses.
+
+	  if (c->size == 3)
+	    {
+	      c->garbage = true;
+	      unsigned first = INVALID, second = INVALID;
+
+	      for (all_literals_in_clause (other, c))
+		if (other != clashing)
+		  {
+		    if (first == INVALID)
+		      first = other;
+		    else
+		      {
+			assert (second == INVALID);
+			second = other;
+		      }
+		    disconnect_literal (solver, other, c);
+		  }
+	      assert (first != INVALID);
+	      assert (second != INVALID);
+	      connect_literal (solver, first, tag_binary_clause (0, second));
+	      connect_literal (solver, second, tag_binary_clause (0, first));
+	      touched = (first == traversed || second == traversed);
+	      ticks += 2;
+	    }
+	  else
+#else
+	  if (c->size > 2)
+#endif
+	    {
+	      // Keep clause as is but remove a literal and reduce size.
+
+	      unsigned *r = c->literals;
+	      const unsigned *end_of_literals = r + c->size;
+	      while (assert (r != end_of_literals), *r != clashing)
+		r++;
+	      while (++r != end_of_literals)
+		r[-1] = *r;
+
+	      c->size--;
+#ifndef NGLUE
+	      assert (!c->glue);
+#endif
+#ifndef NCACHE
+	      c->search = 0;
+#endif
+	      LOGCLS (c, "strengthened");
+	      INC (strengthened);
+	    }
+	}
+      else
+#endif // if '#ifndef NSTRENGTHENING' so end of strengthening code.
+
+	{
+	  mark_garbage (solver, c, "subsumed");
+	  INC (subsumed);
+	}
+    }
+  watches->end = q;
+  if (EMPTY_STACK (*watches))
+    RELEASE_STACK (*watches);
+
+  ADD (subsumption_ticks, ticks);
+
+#ifdef LOGGING
+  if (touched)
+    LOG ("watches of traversed literal %s touched", LOGLIT (traversed));
+#endif
+
+  return touched;
+}
+
+// Use the given clause to subsume other connected clauses.
+
+// We only traverse the occurrence list of a single literal in the clause
+// with the smallest number of occurrences to find subsumed clauses and also
+// bound the maximum size of that list as well as the size of clauses.
+
+// Furthermore only clauses with all literals (actually variables) marked as
+// subsume candidate will be considered, since newly added clauses will mark
+// their variables as subsume candidates.
+
+// If the watch list of the 'traversed' literals is modified we return 'true'
+// in order for the calling function ('backward_subsume_literal') to restart
+// the watch list traversal (because its iterators became invalid).
+
+static bool
+backward_subsume_with_clause (struct satch *solver,
+			      struct clause *c, unsigned traversed)
+{
+#ifndef NVIRTUAL
+  if (!is_temporary_binary (solver, c))
+#endif
+    {
+      assert (!c->subsumed);
+      c->subsumed = true;
+    }
+
+  assert (!solver->level);
+  LOGCLS (c, "backward subsumption with");
+  assert (!c->redundant);
+
+  bool satisfied = false;	// Clause 'c' satisfied.
+  bool touched = false;		// Literal 'traverse' watches touched.
+  bool subsume = true;		// All literals in 'c' marked 'subsume'.
+
+  uint64_t min_pos_occs = UINT64_MAX;
+  uint64_t min_neg_occs = UINT64_MAX;
+  unsigned min_pos_lit = INVALID;
+  unsigned min_neg_lit = INVALID;
+
+  unsigned actual_size = 0;
+
+  const struct watches *const watches = solver->watches;
+  const struct flags *const flags = solver->flags;
+  const signed char *values = solver->values;
+  signed char *marks = solver->marks;
+
+  uint64_t ticks = 2;		// Clause plus watch list.
+
+  for (all_literals_in_clause (lit, c))
+    {
+      signed char value = values[lit];
+
+      if (value > 0)
+	{
+	  LOG ("contains satisfied literal %s", LOGLIT (lit));
+	  satisfied = true;
+	  break;
+	}
+
+      if (value < 0)
+	continue;
+
+      const unsigned idx = INDEX (lit);
+      if (!flags[idx].subsume)
+	{
+	  LOG ("contains non-subsumption candidate %s", LOGVAR (idx));
+	  subsume = false;
+	  break;
+	}
+
+      // Otherwise mark the literal for the subsumption check.
+
+      mark_literal (marks, lit);
+      actual_size++;
+
+      ticks++;
+
+      const size_t pos_occs = SIZE_STACK (watches[lit]);
+      if (pos_occs < min_pos_occs)
+	min_pos_occs = pos_occs, min_pos_lit = lit;
+
+      const unsigned not_lit = NOT (lit);
+
+      const size_t neg_occs = SIZE_STACK (watches[not_lit]);
+      if (neg_occs < min_neg_occs)
+	min_neg_occs = neg_occs, min_neg_lit = not_lit;
+    }
+
+  ADD (subsumption_ticks, ticks);
+
+  if (satisfied)
+    {
+#ifndef NVIRTUAL
+      if (!is_temporary_binary (solver, c))
+#endif
+	mark_garbage (solver, c, "root-level satisfied");
+    }
+  else if (subsume)
+    {
+      LOG ("actual size %u %s clause size %u", actual_size,
+	   actual_size < c->size ? "smaller" : "matches", c->size);
+
+#ifndef NSUBSUMPTIONLIMITS
+      if (min_pos_occs <= subsumption_occurrence_limit)
+#endif
+	{
+	  COVER (min_pos_lit == INVALID);
+	  assert (min_pos_lit != INVALID);
+
+	  LOG ("minimum positive occurrences %" PRIu64 " literal %s",
+	       min_pos_occs, LOGLIT (min_pos_lit));
+
+	  if (backward_subsume_marked (solver, actual_size,
+				       min_pos_lit, c, traversed))
+	    touched = true;
+	}
+#ifdef NVIRTUAL
+      if (!solver->inconsistent && !solver->values[min_neg_lit])
+#endif
+#ifndef NSUBSUMPTIONLIMITS
+	if (min_neg_occs <= subsumption_occurrence_limit)
+#endif
+	  {
+	    COVER (min_neg_lit == INVALID);
+	    assert (min_neg_lit != INVALID);
+
+	    LOG ("minimum negative occurrences %" PRIu64 " literal %s",
+		 min_neg_occs, LOGLIT (min_neg_lit));
+
+	    if (backward_subsume_marked (solver, actual_size,
+					 min_neg_lit, c, traversed))
+	      touched = true;
+	  }
+    }
+
+  for (all_literals_in_clause (lit, c))
+    unmark_literal (marks, lit);
+
+  return touched;
+}
+
+static void
+backward_subsume_literal (struct satch *solver, unsigned lit)
+{
+#ifdef NVIRTUAL
+  if (solver->inconsistent || solver->values[lit])
+    return;
+#endif
+
+  INC (subsumption_ticks);
+
+  const struct watches *const watches = solver->watches + lit;
+#ifndef NSUBSUMPTIONLIMITS
+  if (SIZE_STACK (*watches) > subsumption_occurrence_limit)
+    return;
+#endif
+
+  LOG ("backward subsumption with clauses containing literal %s",
+       LOGLIT (lit));
+
+  uint64_t ticks = CACHE_LINES_OF_STACK (watches);
+
+RESTART:			// If 'watches' touched (added or removed watches).
+
+  for (all_elements_on_stack (union watch, watch, *watches))
+    {
+      struct clause *c = watch.clause;
+#ifndef NVIRTUAL
+      if (is_tagged_clause (c))
+	c = untag_clause (solver, 0, lit, c);	// 1st temporary
+      else
+#endif
+	{
+	  ticks++;
+	  if (c->garbage || c->subsumed)
+	    continue;
+	}
+#ifndef NSUBSUMPTIONLIMITS
+      if (c->size <= subsumption_clause_size_limit)
+#endif
+	if (backward_subsume_with_clause (solver, c, lit))
+	  {
+#ifdef NVIRTUAL
+	    if (solver->inconsistent || solver->values[lit])
+	      break;
+#endif
+	    LOG ("need to restart traversing %s watches", LOGLIT (lit));
+	    goto RESTART;
+	  }
+    }
+
+  ADD (subsumption_ticks, ticks);
+}
+
+#ifndef NVIRTUAL
+
+// In 'backward_subsume_marked' we skip over tagged clauses because if such a
+// tagged clause is subsumed the watch has to be removed immediately instead
+// of marking it 'garbage'.  This is pretty awkward in that context and thus
+// we implement a dedicated routine below to just do that.  It actually does
+// all virtual binary clause (self-) subsumption of that literal in one go
+// and thus we also do not enforce an occurrence limit.
+
+static bool
+remove_duplicated_virtual_binary_clauses (struct satch *solver, unsigned lit)
+{
+  LOG ("removing duplicated virtual binary clauses with %s", LOGLIT (lit));
+  assert (solver->flags[INDEX (lit)].active);
+  assert (!solver->level);
+
+  struct watches *const watches = solver->watches + lit;
+  const union watch *const end = watches->end;
+  union watch *q = watches->begin, *p = q;
+
+  uint64_t ticks = 1 + cache_lines (watches->begin, watches->end);
+
+  signed char *marks = solver->marks;
+  bool assigned = false;
+
+  while (!assigned && p != end)
+    {
+      const union watch watch = *p++;
+      struct clause *c = watch.clause;
+      if (is_tagged_clause (c))
+	{
+	  const unsigned other = tagged_clause_to_literal (c);
+	  const signed char mark = marked_literal (marks, other);
+	  if (mark > 0)
+	    {
+	      really_delete_binary (solver, false, lit, other);
+	      struct clause *d = tag_binary_clause (false, lit);
+	      disconnect_literal (solver, other, d);
+	      INC (subsumed);
+	      ticks++;
+	      continue;
+	    }
+	  if (mark < 0)
+	    {
+	      LOG ("self-subsuming virtual binary unit %s", LOGLIT (lit));
+	      trace_and_check_unit_addition (solver, lit);
+	      INC (strengthened);
+	      assign (solver, lit, 0, true);
+	      assigned = true;
+	    }
+	  else
+	    mark_literal (marks, other);
+	}
+      *q++ = watch;
+    }
+
+  for (const union watch * r = watches->begin; r != q; r++)
+    if (is_tagged_clause (r->clause))
+      unmark_literal (marks, tagged_clause_to_literal (r->clause));
+
+  while (p != end)
+    *q++ = *p++;
+
+  watches->end = q;
+
+  ADD (subsumption_ticks, ticks);
+
+  return !assigned;
+}
+
+#endif
+
+static void
+backward_subsume_variable (struct satch *solver, unsigned idx)
+{
+  LOG ("backward subsumption with clauses containing %s", LOGVAR (idx));
+  assert (solver->flags[idx].subsume);
+  assert (solver->flags[idx].active);
+
+  const unsigned lit = LITERAL (idx);
+  const unsigned not_lit = NOT (lit);
+#ifndef NVIRTUAL
+  if (!remove_duplicated_virtual_binary_clauses (solver, lit))
+    return;
+  if (!remove_duplicated_virtual_binary_clauses (solver, not_lit))
+    return;
+#endif
+  backward_subsume_literal (solver, lit);
+  backward_subsume_literal (solver, not_lit);
+
+  solver->flags[idx].subsume = 2;
+}
+
+#ifndef NSUBSUMPTIONLIMITS
+
+static bool
+subsumption_ticks_limit_hit (struct satch *solver)
+{
+  return solver->statistics.subsumption_ticks > solver->limits.subsume.ticks;
+}
+
+#endif
+
+static void
+full_backward_subsumption (struct satch *solver)
+{
+  if (!more_subsumption_candidates (solver))
+    return;
+
+  START (subsume);
+  const uint64_t subsumptions = INC (subsumptions);
+
+  LOG ("backward subsumption with clauses containing subsume candidates");
+
+  struct flags *flags = solver->flags;
+
+  uint64_t total_subsumed = 0, total_strengthened = 0;
+  uint64_t strengthened;
+  unsigned round = 0;
+
+  do
+    {
+      round++;
+
+      const uint64_t subsumed_before = solver->statistics.subsumed;
+      const uint64_t strengthened_before = solver->statistics.strengthened;
+      const unsigned remaining = solver->statistics.remaining;
+      unsigned scheduled = 0, tried = 0;
+
+      for (all_variables (idx))
+	{
+	  struct flags *f = flags + idx;
+	  if (f->active && (f->subsume &= 1))
+	    scheduled++;
+	}
+
+      for (all_variables (idx))
+	{
+	  struct flags *f = flags + idx;
+	  if (f->active && f->subsume)
+	    {
+	      backward_subsume_variable (solver, idx);
+	      tried++;
+#ifndef NSUBSUMPTIONLIMITS
+	      if (subsumption_ticks_limit_hit (solver))
+		{
+		  message (solver, 4, "subsumption", subsumptions,
+			   "subsumption ticks limit hit");
+		  break;
+		}
+#endif
+	    }
+	}
+
+      message (solver, 3, "subsumption", subsumptions,
+	       "tried %u variables %.0f%% of %u scheduled %.0f%%"
+	       " in round %u", tried, percent (tried, scheduled),
+	       scheduled, percent (scheduled, remaining), round);
+
+      uint64_t subsumed = solver->statistics.subsumed - subsumed_before;
+      strengthened = solver->statistics.strengthened - strengthened_before;
+
+      total_subsumed += subsumed;
+      total_strengthened += strengthened;
+
+      message (solver, 3, "subsumption", subsumptions,
+	       "subsumed %" PRIu64 " and strengthened %" PRIu64
+	       " clauses in round %u", subsumed, strengthened, round);
+
+      report (solver, 1 + !(subsumed + strengthened), 's');
+#ifndef NSUBSUMPTIONLIMITS
+      if (round >= subsumption_rounds)
+	break;
+      if (subsumption_ticks_limit_hit (solver))
+	break;
+#endif
+    }
+  while (!solver->inconsistent && strengthened);
+
+  for (all_irredundant_clauses (c))
+    c->subsumed = false;
+
+  unsigned kept = 0;
+  for (all_variables (idx))
+    {
+      struct flags *f = flags + idx;
+      if (f->active & (f->subsume & 1))
+	kept++;
+    }
+
+  message (solver, 3, "subsumption", subsumptions,
+	   "keeping %u variables scheduled %.0f%%",
+	   kept, percent (kept, solver->statistics.remaining));
+
+  if (!kept)
+    solver->limits.subsume.marked = solver->statistics.marked_subsume;
+
+  message (solver, 2, "subsumption", subsumptions,
+	   "subsumed %" PRIu64 " and strengthened %" PRIu64
+	   " clauses in %u rounds",
+	   total_subsumed, total_strengthened, round);
+
+  STOP (subsume);
+}
+
+#endif
+
+/*------------------------------------------------------------------------*/
+
+// Flush out garbage (satisfied and eliminated) clause occurrences.  Returns
+// the remaining number of occurrences or 'elimination_occurrence_limit + 1'
+// if a clause exceeds the elimination clause size limit or there are too
+// many, i.e., more than 'elimination_occurrence_limit' remaining.
+
+static unsigned
+actual_number_of_occurrences (struct satch *solver, unsigned lit)
+{
+#ifndef NELIMINATIONLIMITS
+  assert (elimination_occurrence_limit < UINT_MAX);
+#endif
+  assert (!solver->flags[INDEX (lit)].fixed);
+
+  struct watches *watches = solver->watches + lit;
+#ifndef NVIRTUAL
+  signed char *values = solver->values;
+#endif
+
+  union watch *begin = watches->begin, *q = begin;
+  const union watch *end = watches->end, *p = q;
+
+  uint64_t ticks = 1;		// To access 'watches'.
+  unsigned res = 0;
+
+  while (p != end)
+    {
+      const union watch watch = *p++;
+
+      struct clause *c = watch.clause;
+#ifndef NVIRTUAL
+      if (is_tagged_clause (c))
+	{
+	  const unsigned other = tagged_clause_to_literal (c);
+	  if (values[other] > 0)
+	    {
+	      really_delete_binary (solver, false, lit, other);
+	      struct clause *d = tag_binary_clause (false, lit);
+	      disconnect_literal (solver, other, d);
+	      ticks++;
+	      continue;
+	    }
+	}
+      else
+#endif
+	{
+	  ticks++;
+	  if (mark_garbage_if_satisfied (solver, c))
+	    continue;
+	}
+
+      *q++ = watch;
+      res++;
+
+#ifndef NELIMINATIONLIMITS
+      if (res > elimination_occurrence_limit)
+	break;
+#ifndef NVIRTUAL
+      if (!is_tagged_clause (c))
+#endif
+	if (c->size > elimination_clause_size_limit)
+	  {
+	    res = elimination_occurrence_limit + 1;
+	    break;
+	  }
+#endif
+    }
+
+  ticks += cache_lines (begin, q);
+  ADD (elimination_ticks, ticks);
+
+  while (p != end)
+    *q++ = *p++;
+
+  watches->end = q;
+  if (EMPTY_STACK (*watches))
+    RELEASE_STACK (*watches);
+
+  return res;
+}
+
+// Check if the given variable matches is still active, its clauses stay
+// below the clause size limit and it does not occur too often.
+
+static bool
+can_be_eliminated (struct satch *solver, unsigned pivot_idx)
+{
+  const struct flags *const f = solver->flags + pivot_idx;
+  if (!f->active)
+    return false;
+  if (!f->eliminate)
+    return false;
+
+  const unsigned lit = LITERAL (pivot_idx);
+  const unsigned not_lit = NOT (lit);
+
+#ifndef NELIMINATIONLIMITS
+
+  const uint64_t pos = actual_number_of_occurrences (solver, lit);
+  const uint64_t neg = actual_number_of_occurrences (solver, not_lit);
+
+  if (pos && neg > elimination_occurrence_limit)
+    return false;
+
+  if (neg && pos > elimination_occurrence_limit)
+    return false;
+
+#else
+
+  (void) actual_number_of_occurrences (solver, lit);
+  (void) actual_number_of_occurrences (solver, not_lit);
+
+#endif
+
+  return true;
+}
+
+// Check whether the given variable produces few resolvents and add them to
+// the resolvents stack.  The limit is the number of original clauses.
+
+// Process unit and empty clauses eagerly though which also requires that we
+// need to check antecedent clauses (again) and later also the saved
+// resolvents for being satisfied (or falsified).
+
+static bool
+produces_few_resolvents (struct satch *solver, unsigned pivot_idx)
+{
+  assert (!solver->inconsistent);
+
+  const unsigned pivot = LITERAL (pivot_idx);
+  const unsigned not_pivot = NOT (pivot);
+
+  struct watches *const pos_watches = solver->watches + pivot;
+  struct watches *const neg_watches = solver->watches + not_pivot;
+
+  assert (EMPTY_STACK (solver->resolvents));
+
+  LOG ("trying to eliminate %s", LOGVAR (pivot_idx));
+
+  const size_t pos_count = SIZE_STACK (*pos_watches);
+  const size_t neg_count = SIZE_STACK (*neg_watches);
+
+  const uint64_t limit = pos_count + neg_count;
+  uint64_t resolvents = 0;
+
+  uint64_t ticks = 2;
+  ticks += CACHE_LINES_OF_STACK (pos_watches);
+  ticks += CACHE_LINES_OF_STACK (neg_watches);
+
+  signed char *marks = solver->marks;
+
+  assert (!solver->level);
+  assert (!solver->values[pivot]);
+
+  // Go over all clauses 'c' in which the variable occurs positively (outer
+  // loop) and all clauses 'd' in which it occurs negative (inner loop) and
+  // resolve 'c' with 'd' on the given variable.  Make sure to skip
+  // satisfied clauses and tautological resolvents.  Save the resolvents on
+  // the resolvents stack but eagerly add units (and the empty clause).
+
+  for (all_elements_on_stack (union watch, pos_watch, *pos_watches))
+    {
+      struct clause *c = pos_watch.clause;
+#ifndef NVIRTUAL
+      if (is_tagged_clause (c))
+	c = untag_clause (solver, 0, pivot, c);
+      else
+#endif
+	{
+	  ticks++;
+	  if (c->garbage)
+	    continue;
+	}
+
+      // Mark literals in 'c' to detect if a literal in 'c' occurs negated
+      // in a 'd' clause which would produce a tautological resolvent.
+
+      for (all_literals_in_clause (lit, c))
+	mark_literal (marks, lit);
+
+      for (all_elements_on_stack (union watch, neg_watch, *neg_watches))
+	{
+	  struct clause *d = neg_watch.clause;
+#ifndef NVIRTUAL
+	  if (is_tagged_clause (d))
+	    d = untag_clause (solver, 1, not_pivot, d);
+	  else
+#endif
+	    {
+	      ticks++;
+	      if (d->garbage)
+		continue;
+	    }
+
+	  LOGCLS (c, "1st antecedent");
+	  LOGCLS (d, "2nd antecedent");
+
+	  INC (resolutions);
+
+	  bool tautological = false;
+	  for (all_literals_in_clause (lit, d))
+	    if (lit != not_pivot && marked_literal (marks, lit) < 0)
+	      {
+		LOG ("tautological resolvent with clashing %s and %s",
+		     LOGLIT (NOT (lit)), LOGLIT (lit));
+		tautological = true;
+		break;
+	      }
+
+	  if (tautological)
+	    continue;
+
+	  LOG ("resolvent non-tautological");
+
+	  if (++resolvents > limit)
+	    break;
+
+	  // Copy literals of 'c' and 'd' to the resolvent stack skipping
+	  // over the pivot and duplicated literals.
+
+	  for (all_literals_in_clause (lit, c))
+	    if (lit != pivot)
+	      PUSH (solver->resolvents, lit);
+
+	  for (all_literals_in_clause (lit, d))
+	    if (!marks[INDEX (lit)])
+	      PUSH (solver->resolvents, lit);
+
+	  PUSH (solver->resolvents, INVALID);
+	}
+
+      for (all_literals_in_clause (lit, c))
+	unmark_literal (marks, lit);
+
+      if (resolvents > limit)
+	break;
+
+      if (solver->inconsistent)
+	break;
+    }
+
+  ADD (elimination_ticks, ticks);
+
+  if (solver->inconsistent)
+    return false;
+
+  if (resolvents > limit)
+    {
+      CLEAR_STACK (solver->resolvents);
+      LOG ("many resolvents %" PRIu64 " > limit %" PRIu64, resolvents, limit);
+      return false;
+    }
+
+  LOG ("few resolvents %" PRIu64 " <= limit %" PRIu64, resolvents, limit);
+  return true;
+}
+
+// Add and connect the temporary resolvent clause.
+
+static void
+add_and_connect_resolvent (struct satch *solver)
+{
+  const size_t size = SIZE_STACK (solver->clause);
+  assert (size <= UINT_MAX);
+
+  if (!size)
+    {
+      LOG ("empty resolvent");
+      solver->inconsistent = true;
+    }
+  else if (size == 1)
+    {
+      const unsigned unit = ACCESS (solver->clause, 0);
+      LOG ("unit resolvent %s", LOGLIT (unit));
+      assign (solver, unit, 0, true);
+    }
+#ifndef NVIRTUAL
+  else if (size == 2)
+    {
+      const unsigned lit = ACCESS (solver->clause, 0);
+      const unsigned other = ACCESS (solver->clause, 1);
+      LOGBIN (false, lit, other, "resolvent");
+      connect_literal (solver, lit, tag_binary_clause (false, other));
+      connect_literal (solver, other, tag_binary_clause (false, lit));
+      INC (irredundant);
+    }
+#endif
+  else
+    {
+      struct clause *resolvent = new_irredundant_clause (solver);
+      LOGCLS (resolvent, "resolvent");
+      connect_clause (solver, resolvent);
+    }
+
+#ifndef NSUBSUMPTION
+
+  // Mark variables in resolvent as subsumption candidates.
+
+  for (all_elements_on_stack (unsigned, lit, solver->clause))
+      mark_subsume_literal (solver, lit);
+
+#endif
+}
+
+// Push the clause on the extension stack with 'eliminated' literal first.
+// See 'extend_solution' for more explanations on why we need this.
+
+static void
+push_clause_on_extension_stack (struct satch *solver,
+				unsigned eliminated, struct clause *c)
+{
+#ifndef NVIRTUAL
+  if (is_tagged_clause (c))
+    c = untag_clause (solver, 0, eliminated, c);
+#endif
+  PUSH (solver->extend, INVALID);	// Clause separator.
+  PUSH (solver->extend, eliminated);
+  for (all_literals_in_clause (lit, c))
+    if (lit != eliminated)
+      PUSH (solver->extend, lit);
+}
+
+static void
+push_unit_on_extension_stack (struct satch *solver, unsigned eliminated)
+{
+  PUSH (solver->extend, INVALID);	// Clause separator.
+  PUSH (solver->extend, eliminated);
+}
+
+static void
+push_clauses_on_extension_stack (struct satch *solver,
+				 unsigned eliminated, struct watches *watches)
+{
+  for (all_elements_on_stack (union watch, watch, *watches))
+      push_clause_on_extension_stack (solver, eliminated, watch.clause);
+}
+
+// Eliminate clause and push it on extension stack with 'eliminated' first.
+
+static void
+eliminate_watched_clause (struct satch *solver,
+			  unsigned eliminated, struct clause *c)
+{
+#ifndef NVIRTUAL
+  if (is_tagged_clause (c))
+    {
+      const unsigned other = tagged_clause_to_literal (c);
+      really_delete_binary (solver, false, eliminated, other);
+      struct clause *d = tag_binary_clause (false, eliminated);
+      disconnect_literal (solver, other, d);
+      INC (elimination_ticks);
+      c = untag_clause (solver, 0, eliminated, c);
+    }
+  else
+#endif
+  if (c->garbage)
+    return;
+#ifndef NVIRTUAL
+  else
+#endif
+    mark_garbage (solver, c, "eliminated");
+
+#ifdef NVIRTUAL
+  (void) eliminated;
+#endif
+}
+
+// Eliminate clauses with literal 'eliminated' by flushing their occurrence
+// lists, marking them as garbage, and pushing them on the extension stack.
+
+static void
+eliminate_watched_clauses (struct satch *solver,
+			   unsigned eliminated, struct watches *watches)
+{
+  for (all_elements_on_stack (union watch, watch, *watches))
+      eliminate_watched_clause (solver, eliminated, watch.clause);
+  RELEASE_STACK (*watches);
+}
+
+// Now eliminate the variable by adding all the saved resolvents from the
+// resolvents stack and then eliminate the clauses in which it occurs.
+
+// Since we might have generated units in the mean time we have to check for
+// satisfied and falsified clauses again (the second time).
+
+static void
+eliminate_variable (struct satch *solver, unsigned pivot_idx)
+{
+  assert (!solver->inconsistent);
+  assert (EMPTY_STACK (solver->clause));
+
+  const unsigned pivot = LITERAL (pivot_idx);
+  const unsigned not_pivot = NOT (pivot);
+
+  LOG ("eliminating %s", LOGVAR (pivot_idx));
+
+  // First mark the variable as eliminated and update counters.
+
+  {
+    struct flags *f = solver->flags + pivot_idx;
+    assert (f->active);
+    assert (!f->eliminated);
+    f->eliminated = true;
+    f->active = false;
+    DEC (remaining);
+    INC (eliminated);
+  }
+
+  // Now copy and add the clauses from the resolvents stack.
+
+  uint64_t ticks = 0;
+
+  {
+    const signed char *const values = solver->values;
+    bool satisfied = false;
+
+    for (all_elements_on_stack (unsigned, lit, solver->resolvents))
+      {
+	if (lit != INVALID)
+	  {
+	    signed char value = values[lit];
+	    if (value > 0)
+	      satisfied = true;
+	    else if (!satisfied && !value)
+	      PUSH (solver->clause, lit);
+	  }
+	else if (satisfied)
+	  {
+	    CLEAR_STACK (solver->clause);
+	    satisfied = false;
+	  }
+	else
+	  {
+	    LOGTMP ("previously resolved");
+	    trace_and_check_temporary_addition (solver);
+	    add_and_connect_resolvent (solver);
+	    ticks += SIZE_STACK (solver->clause);
+	    CLEAR_STACK (solver->clause);
+	    ticks++;
+	    if (solver->inconsistent)
+	      break;
+	  }
+      }
+  }
+
+  if (solver->inconsistent)
+    return;
+
+  CLEAR_STACK (solver->resolvents);
+
+  {
+    struct watches *const pos_watches = solver->watches + pivot;
+    struct watches *const neg_watches = solver->watches + not_pivot;
+
+    const size_t pos_lines = 1 + CACHE_LINES_OF_STACK (pos_watches);
+    const size_t neg_lines = 1 + CACHE_LINES_OF_STACK (neg_watches);
+
+    // Push eliminated clauses on the extension stack.
+
+#if 1
+    // For non-incremental SAT solving we can push only one set of the two
+    // clauses to the stack and simulate the other by pushing a unit.
+
+    if (SIZE_STACK (*pos_watches) < SIZE_STACK (*neg_watches))
+      {
+	ticks += 1 + pos_lines;
+	push_clauses_on_extension_stack (solver, pivot, pos_watches);
+	push_unit_on_extension_stack (solver, not_pivot);
+      }
+    else
+      {
+	ticks += 1 + neg_lines;
+	push_clauses_on_extension_stack (solver, not_pivot, neg_watches);
+	push_unit_on_extension_stack (solver, pivot);
+      }
+#else
+    // For incremental SAT solving we would need to save all clauses.
+
+    push_clauses_on_extension_stack (solver, pivot, pos_watches);
+    push_clauses_on_extension_stack (solver, not_pivot, neg_watches);
+#endif
+
+    // Finally remove all the clauses with the eliminated variables and
+    // release their watcher stacks.
+
+    ticks += 2 + pos_lines + neg_lines;
+
+    eliminate_watched_clauses (solver, pivot, pos_watches);
+    eliminate_watched_clauses (solver, not_pivot, neg_watches);
+  }
+
+  ADD (elimination_ticks, ticks);
+}
+
+/*------------------------------------------------------------------------*/
+
+#ifndef NELIMINATIONLIMITS
+
+// Variable elimination and particularly subsumption have to be bounded for
+// large instances.  Otherwise almost all time is spent in these procedures.
+// We bound the time spent by 'ticks' (predicted cache line accesses) as for
+// propagation during search and allow a fixed fraction (10%) in terms of
+// search ticks since the last variable elimination. We have separate limits
+// for subsumption and elimination to allow each a fair share of the time.
+// The limits are set at the start of variable elimination (for both).
+
+static void
+set_elimination_ticks_limit (struct satch *solver)
+{
+  struct limits *const limits = &solver->limits;
+  const struct statistics *const statistics = &solver->statistics;
+  const uint64_t eliminations = statistics->eliminations;
+#ifndef NINPROCESSING
+  const uint64_t delta = statistics->ticks - limits->eliminate.search;
+  uint64_t limit = delta * elimination_ticks_fraction;
+  message (solver, 2, "elimination", eliminations,
+	   "elimination limit of %" PRIu64 " ticks = %g * search ticks %"
+	   PRIu64, limit, (double) elimination_ticks_fraction, delta);
+  limits->eliminate.ticks = statistics->elimination_ticks + limit;
+#else
+  limits->eliminate.ticks = UINT64_MAX;
+  message (solver, 2, "elimination", eliminations,
+	   "no elimination ticks-limit during preprocessing "
+	   "(inprocessing disabled)");
+#endif
+}
+
+static bool
+elimination_ticks_limit_hit (struct satch *solver)
+{
+  return solver->statistics.elimination_ticks >
+    solver->limits.eliminate.ticks;
+}
+
+#endif
+
+#ifndef NSUBSUMPTIONLIMITS
+
+static void
+set_subsumption_ticks_limit (struct satch *solver)
+{
+  struct limits *const limits = &solver->limits;
+  const struct statistics *const statistics = &solver->statistics;
+  const uint64_t eliminations = statistics->eliminations;
+#ifndef NINPROCESSING
+  const uint64_t delta = statistics->ticks - limits->subsume.search;
+  uint64_t limit = delta * subsumption_ticks_fraction;
+  message (solver, 2, "elimination", eliminations,
+	   "subsumption limit of %" PRIu64 " ticks = %g * search ticks %"
+	   PRIu64, limit, (double) subsumption_ticks_fraction, delta);
+  limits->subsume.ticks = statistics->subsumption_ticks + limit;
+#else
+  limits->subsume.ticks = UINT64_MAX;
+  message (solver, 2, "elimination", eliminations,
+	   "no subsumption ticks-limit during preprocessing "
+	   "(inprocessing disabled)");
+#endif
+}
+
+#endif
+
+/*------------------------------------------------------------------------*/
+
+// The main bounded variable elimination function.
+
+static int
+eliminate_variables (struct satch *solver)
+{
+  START (eliminate);
+  const uint64_t eliminations = INC (eliminations);
+
+  // First backtrack to decision level zero.
+
+  update_phases_and_backtrack_to_root_level (solver);
+  assert (solver->trail.propagate == solver->trail.end);
+
+#ifndef NELIMINATIONLIMITS
+  set_elimination_ticks_limit (solver);
+#endif
+#ifndef NSUBSUMPTIONLIMITS
+  set_subsumption_ticks_limit (solver);
+#endif
+
+  // Switch to dense mode which flushes all watches to redundant clauses and
+  // connects all occurrences of literals in irredundant clauses.
+
+  switch_to_dense_mode (solver);
+
+  // Main elimination loop.
+
+  unsigned eliminated, total = 0, round = 0;
+  const unsigned original = solver->statistics.remaining;
+
+  do
+    {
+#ifndef NSUBSUMPTION
+      full_backward_subsumption (solver);
+      if (!more_elimination_candidates (solver))
+	break;
+#endif
+      const unsigned remaining = solver->statistics.remaining;
+      eliminated = 0;
+      round++;
+
+      for (all_variables (idx))
+	{
+	  if (can_be_eliminated (solver, idx) &&	// Check limits.
+	      produces_few_resolvents (solver, idx))	// Save resolvents.
+	    {
+	      eliminate_variable (solver, idx);	// Add resolvents.
+	      eliminated++;
+	    }
+	  else
+	    solver->flags[idx].eliminate = false;
+
+	  if (solver->inconsistent)
+	    break;
+
+#ifndef NELIMINATIONLIMITS
+	  if (elimination_ticks_limit_hit (solver))
+	    {
+	      message (solver, 4, "elimination", eliminations,
+		       "elimination ticks limit hit");
+	      break;
+	    }
+#endif
+	}
+
+      total += eliminated;
+      message (solver, 3, "elimination", eliminations,
+	       "eliminated %u variables %.0f%% of remaining %u in round %u",
+	       eliminated, percent (eliminated, remaining), remaining, round);
+
+      report (solver, 1 + !eliminated, 'e');
+#ifndef NELIMINATIONLIMITS
+      if (round >= elimination_rounds)
+	break;
+      if (elimination_ticks_limit_hit (solver))
+	break;
+#endif
+    }
+  while (!solver->inconsistent && eliminated);
+
+  unsigned kept = 0;
+  const struct flags *const flags = solver->flags;
+  for (all_variables (idx))
+    {
+      const struct flags *const f = flags + idx;
+      if (!f->active)
+	continue;
+      if (f->eliminate)
+	kept++;
+    }
+
+  message (solver, 3, "elimination", eliminations,
+	   "keeping %u variables scheduled %.0f%%",
+	   kept, percent (kept, solver->statistics.remaining));
+
+  message (solver, 2, "elimination", eliminations,
+	   "eliminated %u variables %.0f%% in total in %u rounds",
+	   total, percent (total, original), round);
+
+  // Collect clauses which are marked garbage, i.e., are root-level
+  // satisfied or contain an eliminated variable.
+
+  mark_and_collect_garbage_clauses_after_elimination (solver);
+
+  // Switch back to sparse mode watching all clauses.
+
+  switch_to_sparse_mode (solver);
+
+  // Need to propagate over redundant clauses too.
+
+  solver->trail.propagate = solver->trail.begin;
+
+#ifndef NINPROCESSING
+
+  // Finally update limits.
+
+  {
+    const struct statistics *const statistics = &solver->statistics;
+    struct limits *const limits = &solver->limits;
+
+    if (!kept)
+      {
+	limits->eliminate.fixed = statistics->fixed;
+	limits->eliminate.marked = statistics->marked_eliminate;
+      }
+
+#ifndef NELIMINATIONLIMITS
+    limits->eliminate.search = statistics->ticks;
+#endif
+#ifndef NSUBSUMPTIONLIMITS
+    limits->subsume.search = statistics->ticks;
+#endif
+
+    const uint64_t interval =
+      scale_interval (elimination_interval, nlognlogn, eliminations);
+    limits->eliminate.conflicts = CONFLICTS + interval;
+
+    message (solver, 4, "elimination", eliminations,
+	     "next limit at %" PRIu64 " after %" PRIu64 " conflicts",
+	     limits->eliminate.conflicts, interval);
+  }
+#endif
+
+  STOP (eliminate);
+
+  return solver->inconsistent ? 20 : 0;
+}
+
+static void
+extend_solution (struct satch *solver)
+{
+  const unsigned *const begin = solver->extend.begin;
+  signed char *const values = solver->values;
+
+  const unsigned *p = solver->extend.end;
+
+  unsigned last = INVALID;
+  bool satisfied = false;
+  signed char value = -1;
+
+  while (p != begin)
+    {
+      const unsigned lit = *--p;
+      if (lit != INVALID)
+	{
+	  value = values[lit];
+	  assert (value);
+	  if (value > 0)
+	    satisfied = true;
+	}
+      else if (!satisfied)
+	{
+	  assert (last != INVALID);
+	  values[last] = 1;
+	  values[NOT (last)] = -1;
+	  LOG ("flipped value of %s", LOGLIT (last));
+	}
+      else
+	satisfied = false;
+      last = lit;
+    }
+}
+
+/*------------------------------------------------------------------------*/
+#endif // of '#ifndef NELIMINATION'
+/*------------------------------------------------------------------------*/
+
+#ifndef NVIVIFICATION
+
+static signed char
+satch_fixed (struct satch *solver, unsigned lit)
+{
+
+  assert (lit < LITERALS);
+  const signed char value = solver->values[lit];
+  if (!value)
+    return 0;
+  if (solver->levels[INDEX (lit)])
+    return 0;
+  return value;
+}
+
+static inline int
+int_compare (long int a, long int b)
+{
+  if (a < b)
+    return -1;
+  if (a == b)
+    return 0;
+  return 1;
+}
+
+#ifdef NRADIXSORT
+
+static inline int
+more_occurrences (const void *cp, const void *dp, void *countsp)
+  {
+      unsigned *counts = (unsigned *) countsp;
+      const unsigned litA = *((unsigned*) cp);
+      const unsigned litB = *((unsigned*) dp);
+      return int_compare (counts[litA], counts[litB]);
+  }
+
+#endif
+
+static void
+vivify_sort_lits_by_counts (struct satch *solver, unsigned *counts,
+			    struct unsigned_stack *c)
+{
+
+#ifndef NRADIXSORT
+  (void) solver;
+#define MORE_OCCURRENCES(LIT) \
+  ~counts[LIT]
+
+  RSORT (unsigned, unsigned, *c, MORE_OCCURRENCES);
+#else
+
+#define MORE_OCCURRENCES(LITA,LITB) \
+  ((~counts[LITA]) < (~counts[LITB]))
+  SORT_STACK (unsigned, *c, MORE_OCCURRENCES);
+#endif
+}
+
+static void
+vivify_sort_stack_by_counts (struct satch *solver, unsigned *counts,
+			     struct unsigned_stack *c)
+{
+  vivify_sort_lits_by_counts (solver, counts, c);
+}
+
+static void
+vivify_sort_clause_by_counts (struct satch *solver, unsigned *counts,
+			      struct clause *c)
+{
+#ifndef NBLOCK
+  assert (!is_tagged_clause (c));
+#endif
+#ifndef NVIRTUAL
+  assert (!is_temporary_binary (solver, c));
+#endif
+  struct unsigned_stack c2 = {.begin = c->literals,
+    .end = c->literals + c->size,
+    .allocated = c->literals + c->size
+  };
+  vivify_sort_lits_by_counts (solver, counts, &c2);
+}
+
+
+static inline bool
+worse_candidate (unsigned* counts, const struct clause *const c, const struct clause *const d)
+{
+  assert (c);
+  assert (d);
+  assert (counts);
+#ifndef NBLOCK
+  assert (!is_tagged_clause (c));
+  assert (!is_tagged_clause (d));
+#endif
+  if (!c->vivify && d->vivify)
+    return true;
+
+  if (c->vivify && !d->vivify)
+    return false;
+
+  unsigned const *p = c->literals;
+  unsigned const *q = d->literals;
+  const unsigned *const e = c->literals + c->size;
+  const unsigned *const f = d->literals + d->size;
+
+  while (p != e && q != f)
+    {
+      const unsigned a = *p++;
+      const unsigned b = *q++;
+      if (a == b)
+	continue;
+      const unsigned u = counts[a];
+      const unsigned v = counts[b];
+      if (u < v)
+        return true;
+      if (u > v)
+        return false;
+      return a < b;
+    }
+
+  if (p != e && q == f)
+    return true;
+  if (p == e && q != f)
+    return false;
+
+  return (long int)c < (long int)d;
+}
+
+
+static void
+sort_vivification_candidates (struct satch *solver,
+			      struct clauses *schedule, unsigned *counts)
+{
+  for (all_pointers_on_stack (struct clause, c, *schedule))
+    {
+      vivify_sort_clause_by_counts (solver, counts, c);
+    }
+#define WORSE_CANDIDATE(c, d) \
+  worse_candidate (counts, c, d)
+
+  SORT_STACK (struct clause*, *schedule, WORSE_CANDIDATE);
+}
+
+static void
+count_literal (unsigned lit, unsigned *counts)
+{
+  const unsigned old_count = counts[lit];
+  const unsigned new_count =
+    (old_count < UINT_MAX) ? old_count + 1 : UINT_MAX;
+  counts[lit] = new_count;
+}
+
+static void
+vivify_count_clause (struct clause *c, unsigned *counts)
+{
+  for (all_literals_in_clause (lit, c))
+    count_literal (lit, counts);
+}
+
+void
+flush_large_watches (struct satch *solver)
+{
+#ifdef NWATCHES
+  (void)solver;
+#else
+  LOG ("flush large clause watches");
+  struct watches *all_watches = solver->watches;
+  for (all_literals (lit))
+    {
+      struct watches *lit_watches = all_watches + lit;
+#ifndef NBLOCK
+      union watch *q = lit_watches->begin;
+      const union watch *const end = lit_watches->end, *p = q;
+      while (p != end)
+	{
+	  const union watch watch = *q++ = *p++;	// Keep header by default.
+	  const struct header header = watch.header;
+	  if (header.binary)
+	    {
+#ifdef NVIRTUAL
+	      *q++ = *p++;	// Copy clause too.
+#endif
+	    }
+	  else
+	    {
+	      q--;		// don't keep clause
+	      p++;
+	    }
+	}
+      lit_watches->end = q;
+#else
+      lit_watches->end = lit_watches->begin;
+#endif
+    }
+#endif
+#ifndef NDEBUG
+  solver->watching = false;
+#endif
+}
+
+void
+watch_large_clauses (struct satch *solver)
+{
+  LOG ("rewatch large clause watches");
+  for (all_irredundant_clauses (c))
+    {
+      if (c->garbage)
+	continue;
+#ifndef NCACHE
+      c->search = 0;
+#endif
+#ifndef NWATCHES
+      watch_clause (solver, c);
+#endif
+    }
+  for (all_redundant_clauses (c))
+    {
+      if (c->garbage)
+	continue;
+#ifndef NCACHE
+      c->search = 0;
+#endif
+#ifndef NWATCHES
+      watch_clause (solver, c);
+#endif
+    }
+#ifndef NDEBUG
+  solver->watching = true;
+#endif
+}
+
+static void
+promote_clause (struct satch *solver, struct clause *c, unsigned glue)
+{
+#ifdef NGLUE
+  (void) solver;
+  (void) c;
+  (void) glue;
+  return;
+#else
+#ifndef NTIER1
+  const unsigned old_glue = c->glue;
+  assert (old_glue >= c->glue);
+
+  c->glue = glue;
+  if (old_glue > tier1_glue_limit && glue <= tier1_glue_limit)
+    {
+      LOGCLS (c, "promoting to TIER1");
+    }
+#ifndef NTIER2
+  else if (old_glue > tier2_glue_limit && glue <= tier2_glue_limit)
+    {
+      LOGCLS (c, "promoting to TIER2");
+#ifndef NUSED
+      c->used = 2;
+#endif
+    }
+  else
+    {
+      LOGCLS (c, "keeping to new glue %u in tier3", glue);
+    }
+#endif
+#else
+  (void) solver;
+  c->glue = glue;
+#endif
+#endif
+}
+
+// The function marked_literal cannot be used for vivification because it only marks variables
+// instead of literals despite the name (!).
+inline static signed char
+vivify_marked_literal (struct satch *solver, unsigned lit)
+{
+  const unsigned idx = INDEX (lit);
+  signed char res = solver->vivify_marks[idx];
+  return (res == INT_SIGN (lit));
+}
+
+void
+vivify_mark_literal (struct satch *solver, unsigned lit)
+{
+
+  const unsigned idx = INDEX (lit);
+  assert (!solver->vivify_marks[idx]);
+  solver->vivify_marks[idx] = INT_SIGN (lit);
+}
+
+static struct clause *
+vivify_boolean_constraint_propagation (struct satch *solver,
+				       struct clause *ignore)
+{
+  struct trail *trail = &solver->trail;
+  unsigned *propagate = trail->propagate;
+  unsigned *p;
+
+  assert (trail->begin <= propagate);
+  assert (propagate <= trail->begin + VARIABLES);
+
+  struct clause *conflict = 0;
+  uint64_t ticks = 0;
+
+  if (ignore)
+    LOGCLS (ignore, "vivify: BCP ignoring");
+  for (p = propagate; !conflict && p != trail->end; p++)
+    conflict = propagate_literal (solver, *p, ignore, &ticks);
+
+  ADD (probing_ticks, ticks);
+  solver->trail.propagate = p;
+  const unsigned propagated = p - propagate;
+
+  ADD (vivify_propagations, propagated);
+
+  if (conflict)
+    INC (vivify_conflicts);
+
+  return conflict;
+}
+
+static void
+vivify_binary_or_large_conflict (struct satch *solver,
+				 struct clause *conflict)
+{
+  assert (solver->level);
+  assert (conflict->size >= 2);
+  LOGCLS (conflict, "vivify analyzing conflict (red: %d)",
+	  conflict->redundant);
+#if LOGGING || !defined(NDEBUG)
+  unsigned conflict_level = 0;
+#endif
+  for (all_literals_in_clause (lit, conflict))
+    {
+      assert (solver->values[lit] < 0);
+      const unsigned level = solver->levels[INDEX (lit)];
+      if (!level)
+	continue;
+#if LOGGING || !defined(NDEBUG)
+      if (level > conflict_level)
+	conflict_level = level;
+#endif
+      mark_analyzed (solver, INDEX (lit));
+    }
+  LOG ("vivify conflict level %u", conflict_level);
+  assert (0 < conflict_level);
+  assert (conflict_level == solver->level);
+}
+
+static void
+vivify_mark_garbage (struct satch *solver, struct clause *c, const char *msg)
+{
+  assert (solver->watching);
+#ifndef NWATCHES
+  unwatch_literal (solver, c->literals[0], c);
+  unwatch_literal (solver, c->literals[1], c);
+#else
+  for (all_literals_in_clause (lit, c))
+    disconnect_literal (solver, lit, c);
+#endif
+  mark_garbage (solver, c, msg);
+}
+
+static bool
+vivify_learn (struct satch *solver,
+	      struct clause *c,
+	      unsigned non_false, bool irredundant, unsigned implied)
+{
+  bool res;
+
+  size_t size = SIZE_STACK (solver->clause);
+  assert (size <= non_false);
+  assert (2 < non_false);
+
+  if (size == 1)
+    {
+      LOG ("size 1 learned unit clause forces jump level 0");
+      if (solver->level)
+	backtrack (solver, 0);
+
+      const unsigned unit = ACCESS (solver->clause, 0);
+      assign (solver, unit, 0, true);
+      solver->iterate = true;
+      vivify_mark_garbage (solver, c, "subsumed by unit");
+      assert (!solver->level);
+      struct clause *conflict = boolean_constraint_propagation (solver);
+      if (conflict)
+	{
+	  assert (solver->level == 0);
+	  LOGCLS (conflict, "found conflict at level 0");
+	  solver->inconsistent = true;
+	  return false;
+	}
+      INC (vivify_strengthened);
+      res = true;
+    }
+  else
+    {
+      const unsigned *const levels = solver->levels;
+      const signed char *const values = solver->values;
+
+      unsigned highest_level = 0;
+      for (all_elements_on_stack (unsigned, lit, solver->clause))
+	{
+	  const signed char value = values[lit];
+	  if (!value)
+	    {
+	      LOG ("unassigned literal %s in learned clause", LOGLIT (lit));
+	      highest_level = INVALID_LEVEL;
+	      break;
+	    }
+	  const unsigned idx = INDEX (lit);
+	  const unsigned level = levels[idx];
+	  assert (level > 0);
+	  if (level > highest_level)
+	    highest_level = level;
+	}
+
+      if (highest_level != INVALID_LEVEL)
+	LOG ("highest level %u in learned clause", highest_level);
+
+      unsigned literals_on_highest_level = 0;
+      for (all_elements_on_stack (unsigned, lit, solver->clause))
+	{
+	  const unsigned value = values[lit];
+	  if (!value)
+	    literals_on_highest_level++;
+	  else
+	    {
+	      const unsigned idx = INDEX (lit);
+	      const unsigned level = levels[idx];
+	      assert (level > 0);
+	      if (level == highest_level)
+		literals_on_highest_level++;
+	    }
+	}
+#ifdef LOGGING
+      if (highest_level == INVALID_LEVEL)
+	LOG ("found %u unassigned literals", literals_on_highest_level);
+      else
+	LOG ("found %u literals on highest level", literals_on_highest_level);
+#endif
+      if (highest_level == INVALID_LEVEL && literals_on_highest_level > 1)
+	LOG ("no need to backtrack with more than one unassigned literal");
+      else
+	{
+	  unsigned jump_level = 0;
+	  for (all_elements_on_stack (unsigned, lit, solver->clause))
+	    {
+	      const signed char value = values[lit];
+	      if (!value)
+		continue;
+	      const unsigned idx = INDEX (lit);
+	      const unsigned level = levels[idx];
+	      if (level == highest_level)
+		continue;
+	      if (level > jump_level)
+		jump_level = level;
+	    }
+	  LOG ("determined jump level %u", jump_level);
+
+	  if (jump_level < solver->level)
+	    backtrack (solver, jump_level);
+	}
+
+#ifndef NVIRTUAL
+      if (size == 2)
+	{
+#ifdef LOGGING
+	  const unsigned lit = ACCESS (solver->clause, 0);
+	  const unsigned other = ACCESS (solver->clause, 1);
+#endif
+	  const bool redundant = c->redundant;
+	  LOGBIN (false, lit, other, "vivification");
+	  trace_and_check_temporary_addition (solver);
+	  add_new_binary_and_watch_it (solver, redundant);
+
+	  vivify_mark_garbage (solver, c, "vivified clause");
+	  INC (vivify_strengthened);
+	  res = true;
+	}
+      else
+#endif
+      if (size < non_false)
+	{
+#ifndef NVIRTUAL
+	  assert (size > 2);
+#else
+	  assert (size >= 2);
+#endif
+	  CLEAR_STACK (solver->clause);
+	  assert (EMPTY_STACK (solver->clause));
+	  const unsigned old_size = c->size;
+	  unsigned new_size = 0, *lits = c->literals;
+#ifndef NWATCHES
+	  const unsigned litA = lits[0];
+	  const unsigned litB = lits[1];
+#endif
+
+	  assert (EMPTY_STACK (solver->clause));
+	  for (unsigned i = 0; i < old_size; i++)
+	    {
+	      const unsigned lit = lits[i];
+	      assert (lit < LITERALS);
+	      PUSH (solver->clause, lit);
+	      bool keep = true;
+	      if (lit != implied)
+		{
+		  const unsigned idx = INDEX (lit);
+		  const signed char mark = solver->marks[idx];
+		  if (!(mark & ANALYZED))
+		    keep = false;
+		  else if (solver->reasons[idx])
+		    keep = false;
+		  if (!keep)
+		    LOG
+		      ("literal %s not to be kept (has reason? %d; not analyzed? %d)",
+		       LOGLIT (lit), solver->reasons[idx] ? 1 : 0,
+		       !(mark & ANALYZED) ? 1 : 0);
+		}
+	      if (!c->redundant)
+		{
+#if !defined(NSUBSUMPTION) && (!defined(NREDUCE) || !defined(NELIMINATION))
+		  if (keep)
+		    mark_subsume_variable (solver, INDEX (lit));
+#endif
+#ifndef NELIMINATION
+		  if (!keep)
+		    mark_eliminate_literal (solver, lit);
+#endif
+		}
+	      if (keep)
+		lits[new_size++] = lit;
+              else {
+#ifdef NWATCHES
+                    disconnect_literal (solver, lit, c);
+#endif
+              }
+	    }
+	  assert (new_size < old_size);
+	  assert (new_size == size);
+	  if (!c->shrunken)
+	    {
+	      c->shrunken = true;
+	      lits[old_size - 1] = INVALID;
+	    }
+	  c->size = new_size;
+	  trace_and_check_clause_addition (solver, c, INVALID);
+	  trace_and_check_deletion (solver, SIZE_STACK (solver->clause),
+				    solver->clause.begin);
+	  CLEAR_STACK (solver->clause);
+	  if (!c->redundant
+#ifndef NGLUE
+	      && c->glue >= new_size
+#endif
+	    )
+	    {
+	      promote_clause (solver, c, new_size - 1);
+	    }
+#ifndef NWATCHES
+	  unwatch_literal (solver, litA, c);
+	  unwatch_literal (solver, litB, c);
+#endif
+
+#ifndef NVIRTUAL
+	  if (new_size == 2)
+	    {
+	      assert (EMPTY_STACK (solver->clause));
+	      PUSH (solver->clause, c->literals[0]);
+	      PUSH (solver->clause, c->literals[1]);
+	      add_new_binary_and_watch_it (solver, c->redundant);
+	      CLEAR_STACK (solver->clause);
+	      vivify_mark_garbage (solver, c,
+				   "vivify shortened to binary clause");
+	    }
+	  else
+#endif
+	    {
+#ifndef NCACHE
+	      c->search = 0;
+#endif
+	      LOGCLS (c, "vivified shrunken");
+	      INC (vivify_strengthened);
+
+#ifndef NWATCHES
+	      // Beware of 'stale blocking literals' ... so rewatch if shrunken.
+	      watch_clause (solver, c);
+#else
+              count_clause (solver, c);
+#endif
+	    }
+	  res = true;
+	}
+      else if (irredundant && !c->redundant)
+	{
+	  INC (vivify_subsume);
+	  vivify_mark_garbage (solver, c, "vivify subsumed (learn)");
+	  res = true;
+	}
+      else
+	{
+	  LOG ("vivify failed");
+	  res = false;
+	}
+    }
+
+  return res;
+}
+
+static bool
+vivify_analyze (struct satch *solver, struct clause *c,
+		struct clause *conflict, bool *irredundant_ptr)
+{
+  assert (conflict);
+  assert (!EMPTY_STACK (solver->analyzed));
+  LOGCLS (conflict, "vivify analyze: marking");
+
+  signed char *vivify_marks = solver->vivify_marks;
+  signed char *marks = solver->marks;
+  for (all_literals_in_clause (lit, c))
+    {
+      LOG ("marking literal %s %s", LOGLIT (lit), LOGLIT (NOT (lit)));
+      vivify_mark_literal (solver, lit);
+    }
+
+  bool subsumed = false;
+
+  if (c->redundant || !conflict->redundant)
+    {
+      subsumed = true;
+      for (all_literals_in_clause (lit, conflict))
+	{
+	  const signed char value = satch_fixed (solver, lit);
+	  if (value < 0)
+	    continue;
+	  assert (!value);
+	  if (vivify_marked_literal (solver, lit) > 0)
+	    continue;
+	  subsumed = false;
+	  break;
+	}
+      if (subsumed)
+	LOGCLS (conflict, "vivify subsuming");
+    }
+
+  size_t analyzed = 0;
+  bool irredundant = conflict && !conflict->redundant;
+
+  const unsigned *const levels = solver->levels;
+  const signed char *const values = solver->values;
+  struct clause *const *const reasons = solver->reasons;
+
+  while (analyzed < SIZE_STACK (solver->analyzed))
+    {
+      const unsigned idx = ACCESS (solver->analyzed, analyzed).idx;
+      const unsigned lit = values[LITERAL (idx)] > 0 ?
+	LITERAL (idx) : NOT (LITERAL (idx));
+      assert (values[lit]);
+      const unsigned not_lit = NOT (lit);
+      struct clause *const reason = reasons[INDEX (lit)];
+      analyzed++;
+      assert (levels[idx]);
+      assert (marks[idx] & ANALYZED);
+      if (!reasons[idx])
+	{
+	  LOG ("vivify analyzing decision %s", LOGLIT (not_lit));
+	  PUSH (solver->clause, not_lit);
+	}
+#ifndef NBLOCK
+      else if (is_tagged_clause (reason))
+	{
+	  const unsigned other = tagged_clause_to_literal (reason);
+	  const bool redundant = tagged_clause_to_redundant (reason);
+	  if (redundant)
+	    irredundant = false;
+	  assert (values[other] < 0);
+	  assert (levels[INDEX (other)]);
+	  if (c->redundant || !redundant)
+	    {
+	      if (vivify_marked_literal (solver, lit) < 0 &&
+		  vivify_marked_literal (solver, other) < 0)
+		{
+		  LOG ("vivify subsuming by binary clause %s %s",
+		       LOGLIT (lit), LOGLIT (other));
+		  subsumed = true;
+		}
+	    }
+	  if (marks[INDEX (other)] & ANALYZED)
+	    continue;
+	  LOG ("vivify analyzing %s reason %s %s",
+	       LOGLIT (lit), LOGLIT (lit), LOGLIT (other));
+	  mark_analyzed (solver, INDEX (other));
+	}
+#endif
+      else
+	{
+	  LOGCLS (reason, "vivify analyzing %s reason", LOGLIT (lit));
+	  if (reason->redundant)
+	    irredundant = false;
+	  bool subsuming = vivify_marked_literal (solver, lit);
+	  for (all_literals_in_clause (other, reason))
+	    {
+	      if (other == lit)
+		continue;
+	      if (other == not_lit)
+		continue;
+	      assert (values[other] < 0);
+	      if (!levels[INDEX (other)])
+		continue;
+	      if (!vivify_marked_literal (solver, other))
+		subsuming = false;
+	      if (marks[INDEX (other)] & ANALYZED)
+		continue;
+	      mark_analyzed (solver, INDEX (other));
+	    }
+	  if (subsuming && (c->redundant || !reason->redundant))
+	    {
+	      subsumed = true;
+	      LOGCLS (reason, "vivify subsuming");
+	    }
+	}
+    }
+
+  for (all_literals_in_clause (lit, c))
+    {
+      LOG ("unmarking literal %s %s", LOGLIT (lit), LOGLIT (NOT (lit)));
+      unmark_literal (vivify_marks, lit);
+    }
+
+  const size_t size = SIZE_STACK (solver->clause);
+  assert (size > 0);
+  if (subsumed)
+    {
+      if (size == 1)
+	{
+	  LOG ("ignoring subsumed and instead learning unit clause");
+#ifndef NDEBUG
+	  assert (solver->level);
+	  const unsigned decision =
+	    *ACCESS (solver->control, solver->level - 1).trail;
+	  const unsigned unit = ACCESS (solver->clause, 0);
+	  assert (NOT (unit) == decision);
+#endif
+	  subsumed = false;
+	}
+      else
+	LOGTMP ("vivify ignored learned");
+    }
+  if (!subsumed)
+    {
+      *irredundant_ptr = irredundant;
+      LOGTMP ("vivify learned");
+    }
+
+  return subsumed;
+}
+
+static void
+vivify_reset_analyzed (struct satch *solver)
+{
+  signed char *marks = solver->marks;
+  for (all_elements_on_stack (struct analyzed, analyzed, solver->analyzed))
+    {
+      const unsigned idx = analyzed.idx;
+      marks[idx] &= ~ANALYZED;
+    }
+  CLEAR_STACK (solver->analyzed);
+  CLEAR_STACK (solver->clause);
+}
+
+#ifndef NVIVIFYIMPLY
+static struct clause *
+vivify_unit_conflict (struct satch *solver, unsigned lit)
+{
+  assert (solver->values[lit] > 0);
+  const unsigned idx = INDEX (lit);
+  LOG ("vivify analyzing conflict unit %s", LOGLIT (NOT (lit)));
+  assert (!(solver->marks[idx] & ANALYZED));
+  struct clause *conflict;
+  struct clause *const reason = solver->reasons[idx];
+
+#ifndef NBLOCK
+  if (is_tagged_clause (reason))
+    {
+      conflict = untag_clause (solver, 0, lit, reason);
+    }
+  else
+#endif
+    conflict = reason;
+  mark_analyzed (solver, idx);
+  PUSH (solver->clause, lit);
+  return conflict;
+}
+#endif
+
+
+static bool
+vivify_clause (struct satch *solver, struct clause *c, unsigned *counts)
+{
+  assert (!c->garbage);
+  assert (!solver->inconsistent);
+  const unsigned *levels = solver->levels;
+  struct unsigned_stack *sorted = &solver->sorted;
+
+  LOGCLS (c, "trying to vivify candidate");
+  CLEAR_STACK (*sorted);
+
+  for (all_literals_in_clause (lit, c))
+    {
+      const char value = satch_fixed (solver, lit);
+      if (value < 0)
+	continue;
+      if (value > 0)
+	{
+	  vivify_mark_garbage (solver, c, "root-level satisfied");
+	  break;
+	}
+      PUSH (*sorted, lit);
+    }
+
+
+  if (c->garbage)
+    return false;
+  const unsigned non_false = SIZE_STACK (*sorted);
+
+  assert (1 < non_false);
+  assert (non_false <= c->size);
+
+#ifndef NLOGGING
+  if (!non_false)
+    LOG ("no root level falsified literal");
+  else if (non_false == c->size)
+    LOG ("all literals root level unassigned");
+  else
+    LOG ("found %u root level non-falsified literals", non_false);
+#endif
+  if (non_false == 2)
+    {
+      LOGCLS (c, "skipping actually binary");
+      return false;
+    }
+
+  unsigned unit = INVALID;
+
+  for (all_literals_in_clause (lit, c))
+    {
+      const char value = solver->values[lit];
+      if (value < 0)
+	continue;
+      if (!value)
+	{
+	  unit = INVALID;
+	  break;
+	}
+      assert (value > 0);
+      if (unit != INVALID)
+	{
+	  unit = INVALID;
+	  break;
+	}
+      unit = lit;
+    }
+  if (unit == INVALID)
+    LOG ("non-reason candidate clause");
+  else
+    {
+      LOG ("candidate is the reason of %s", LOGLIT (unit));
+      const unsigned level = levels[INDEX (unit)];
+      assert (level > 0);
+      LOG ("forced to backtrack to level %u", level - 1);
+      backtrack (solver, level - 1);
+    }
+
+  vivify_sort_stack_by_counts (solver, counts, sorted);
+
+  unsigned implied = INVALID;
+  unsigned falsified = 0;
+  unsigned satisfied = 0;
+  struct clause *conflict = 0;
+  unsigned level = 0;
+  bool res = false;
+  assert (non_false == SIZE_STACK (*sorted));
+  for (all_elements_on_stack (unsigned, lit, *sorted))
+    {
+      if (level++ < solver->level)
+	{
+	  struct level frame = ACCESS (solver->control, level - 1);
+	  const unsigned not_lit = NOT (lit);
+	  if (*frame.trail == not_lit)
+	    {
+	      LOG ("reusing assumption %s", LOGLIT (not_lit));
+	      INC (vivify_reused);
+	      INC (vivify_probes);
+	      assert (solver->values[lit] < 0);
+	      continue;
+	    }
+
+	  LOG ("forced to backtrack to decision level %u", level - 1);
+	  backtrack (solver, level - 1);
+	}
+      const char value = solver->values[lit];
+      assert (!value || levels[INDEX (lit)] <= level);
+      if (!value)
+	{
+	  LOG ("literal %s unassigned", LOGLIT (lit));
+	  const unsigned not_lit = NOT (lit);
+	  INC (vivify_probes);
+	  solver->level++;
+	  assign (solver, not_lit, 0, false);
+	  assert (solver->level >= 1);
+	  conflict = vivify_boolean_constraint_propagation (solver, c);
+	  if (!conflict)
+	    continue;
+	  vivify_binary_or_large_conflict (solver, conflict);
+	  assert (!EMPTY_STACK (solver->analyzed));
+	  break;
+	}
+
+      if (value < 0)
+	{
+	  assert (levels[INDEX (lit)]);
+	  LOG ("literal %s already falsified", LOGLIT (lit));
+	  falsified++;
+	  continue;
+	}
+
+      satisfied++;
+      assert (value > 0);
+      assert (levels[INDEX (lit)]);
+      LOG ("literal %s already satisfied", LOGLIT (lit));
+
+#ifndef NVIVIFYIMPLY
+      if (!c->redundant)
+	{
+	  implied = lit;
+	  conflict = vivify_unit_conflict (solver, lit);
+	  assert (!EMPTY_STACK (solver->analyzed));
+	  assert (conflict);
+	}
+      else
+	{
+	  vivify_mark_garbage (solver, c, "vivify implied");
+	  INC (vivify_implied);
+	  res = true;
+	}
+#endif
+      break;
+    }
+
+  if (c->garbage)
+    {
+      assert (!conflict);
+      assert (EMPTY_STACK (solver->analyzed));
+    }
+  else if (conflict)
+    {
+      assert (!EMPTY_STACK (solver->analyzed));
+      assert (solver->level);
+      bool irredundant;
+      const bool subsumed =
+	vivify_analyze (solver, c, conflict, &irredundant);
+
+      backtrack (solver, solver->level - 1);
+
+      if (subsumed)
+	{
+	  vivify_mark_garbage (solver, c, "vivify subsumed");
+	  LOGCLS (c, "subsuming clause: ");
+	  INC (vivify_subsume);
+	  INC (subsumed);
+	  res = true;
+	}
+      else
+	res = vivify_learn (solver, c, non_false, irredundant, implied);
+      vivify_reset_analyzed (solver);
+    }
+  else if (falsified && !satisfied)
+    {
+      LOG ("vivified %u false literals", falsified);
+      assert (EMPTY_STACK (solver->clause));
+      struct clause *const *const reasons = solver->reasons;
+      assert (non_false == SIZE_STACK (*sorted));
+      for (all_elements_on_stack (unsigned, lit, *sorted))
+	{
+	  const unsigned idx = INDEX (lit);
+	  assert (levels[idx]);
+	  if (reasons[idx])
+	    continue;
+	  assert (!(solver->marks[idx] & ANALYZED));
+	  mark_analyzed (solver, idx);
+	  PUSH (solver->clause, lit);
+	}
+      res = vivify_learn (solver, c, non_false, false, INVALID);
+      vivify_reset_analyzed (solver);
+    }
+  else
+    {
+      assert (EMPTY_STACK (solver->analyzed));
+      LOG ("vivify failed");
+    }
+
+  if (!res)
+    return false;
+
+  INC (vivified);
+
+  assert (EMPTY_STACK (solver->analyzed));
+  assert (EMPTY_STACK (solver->clause));
+  return true;
+}
+
+static bool
+simplify_vivification_candidate (struct satch *solver, struct clause *const c)
+{
+  assert (!solver->level);
+  assert (!c->garbage);
+  bool satisfied = false;
+  assert (EMPTY_STACK (solver->clause));
+  const signed char *const values = solver->values;
+  LOGCLS (c, "simplifying for vivification");
+  for (all_literals_in_clause (lit, c))
+    {
+      const signed char value = values[lit];
+      if (value > 0)
+	{
+	  satisfied = true;
+	  mark_garbage (solver, c, "vivification satisfied candidate");
+	  break;
+	}
+      if (!value)
+	PUSH (solver->clause, lit);
+    }
+  unsigned non_false = SIZE_STACK (solver->clause);
+  if (satisfied)
+    {
+      CLEAR_STACK (solver->clause);
+      return true;
+    }
+  if (non_false == c->size)
+    {
+      CLEAR_STACK (solver->clause);
+      return false;
+    }
+  assert (1 < non_false);
+  assert (non_false <= c->size);
+
+#ifdef NWATCHES
+      for (all_literals_in_clause (lit, c)) {
+        disconnect_literal (solver, lit, c);
+      }
+#endif
+
+#ifndef NVIRTUAL
+  if (non_false == 2)
+    {
+#ifdef LOGGING
+      const unsigned first = ACCESS (solver->clause, 0);
+      const unsigned second = ACCESS (solver->clause, 1);
+#endif
+      trace_and_check_temporary_addition (solver);
+      LOGBIN (c->redundant, first, second, "vivification shrunken candidate");
+      add_new_binary_and_watch_it (solver, c->redundant);
+      mark_garbage (solver, c, "vivification shrunken candidate");
+    }
+  else
+#endif
+    {
+      const unsigned old_size = c->size;
+      unsigned new_size = 0, *lits = c->literals;
+      CLEAR_STACK (solver->clause);
+      for (unsigned i = 0; i < old_size; i++)
+	{
+	  const unsigned lit = lits[i];
+	  PUSH (solver->clause, lit);
+	  const signed char value = solver->values[lit];
+	  if (value != 0 && solver->levels[INDEX (lit)] == 0)
+	    continue;
+	  assert (value <= 0);
+	  if (value < 0)
+	    continue;
+	  lits[new_size++] = lit;
+	}
+#ifndef NVIRTUAL
+      assert (2 < new_size);
+#endif
+      assert (new_size == non_false);
+      assert (new_size < old_size);
+      c->size = new_size;
+#ifndef NCACHE
+      c->search = 0;
+#endif
+      if (c->redundant
+#ifndef NGLUE
+	  && c->glue >= new_size
+#endif
+	)
+	promote_clause (solver, c, new_size - 1);
+      if (!c->shrunken)
+	{
+	  c->shrunken = true;
+	  lits[old_size - 1] = INVALID;
+	}
+      LOGCLS (c, "vivification shrunken candidate");
+      trace_and_check_clause_addition (solver, c, INVALID);
+      trace_and_check_deletion (solver, SIZE_STACK (solver->clause),
+				solver->clause.begin);
+#ifdef NWATCHES
+      connect_clause (solver, c);
+      count_clause (solver, c);
+#endif
+
+    }
+  CLEAR_STACK (solver->clause);
+  return false;
+}
+
+static void
+schedule_vivification_candidates (struct satch *solver, unsigned *counts
+#ifdef LOGGING
+				  , const char *type
+#endif
+				  , bool redundant
+#ifndef NTIER2
+				  , bool tier2
+#endif
+  )
+{
+  unsigned lower_glue_limit, upper_glue_limit;
+#ifndef NTIER2
+  if (tier2)
+    {
+      lower_glue_limit = tier1_glue_limit + 1;
+      upper_glue_limit = tier2_glue_limit;
+    }
+  else
+#endif
+#ifndef NTIER1
+    {
+      lower_glue_limit = 0;
+      upper_glue_limit = tier1_glue_limit;
+    }
+#endif
+#if (defined(NTIER1) && defined(NTIER2)) || defined(NGLUE)
+    {
+      lower_glue_limit = 0;
+      upper_glue_limit = 10;
+    }
+
+#endif
+  size_t prioritized = 0;
+  for (unsigned prioritize = 0; prioritize < 2; prioritize++)
+    {
+      if (!redundant)
+	{
+	  for (all_irredundant_clauses (c))
+	    {
+	      if (c->garbage)
+		continue;
+	      if (c->redundant)
+		continue;
+#ifdef NVIRTUAL
+	      if (c->size == 2)
+		continue;
+#endif
+	      if (c->vivify != prioritize)
+		{
+		  continue;
+		}
+	      if (simplify_vivification_candidate (solver, c))
+		continue;
+	      if (prioritize)
+		prioritized++;
+	      vivify_count_clause (c, counts);
+	      PUSH (solver->vivification_schedule, c);
+	    }
+	}
+      else
+	{
+	  for (all_redundant_clauses (c))
+	    {
+	      if (c->garbage)
+		continue;
+	      if (!c->redundant)
+		continue;
+#ifdef NVIRTUAL
+	      if (c->size == 2)
+		continue;
+#endif
+
+#if !(defined(NTIER1) && defined(NTIER2)) && !defined(NGLUE)
+	      if (c->glue < lower_glue_limit)
+		continue;
+	      if (c->glue > upper_glue_limit)
+		continue;
+#else
+	      if (c->size < lower_glue_limit)
+		continue;
+	      if (c->size > upper_glue_limit)
+		continue;
+#endif
+	      if (c->vivify != prioritize)
+		{
+		  continue;
+		}
+	      if (simplify_vivification_candidate (solver, c))
+		continue;
+	      if (prioritize)
+		prioritized++;
+	      vivify_count_clause (c, counts);
+	      PUSH (solver->vivification_schedule, c);
+	    }
+	}
+    }
+
+#ifdef LOGGING
+  size_t scheduled = SIZE_STACK (solver->vivification_schedule);
+#endif
+  if (prioritized)
+    {
+      LOG ("prioritized %zu %s clauses %.0f%%", prioritized,
+	   type, percent (prioritized, scheduled));
+    }
+  else
+    {
+      LOG ("prioritized all %zu clauses %s", scheduled, type);
+      for (all_pointers_on_stack
+	   (struct clause, c, solver->vivification_schedule))
+	{
+#ifndef NVIRTUAL
+	  assert (!is_tagged_clause (c));
+#endif
+	  c->vivify = true;
+	}
+    }
+}
+
+enum round
+{
+#if (defined(NTIER1) && defined(NTIER1)) || defined(NGLUE)
+  REDUNDANT_ROUND = 0,
+#endif
+#ifndef NTIER1
+  REDUNDANT_TIER1_ROUND = 1,
+#endif
+#ifndef NTIER2
+  REDUNDANT_TIER2_ROUND = 2,
+#endif
+  IRREDUNDANT_ROUND = 3
+};
+
+static size_t
+vivify_round (struct satch *solver, unsigned round, uint64_t delta,
+	      double effort)
+{
+  assert (EMPTY_STACK (solver->vivification_schedule));
+  char tag;
+#ifdef LOGGING
+  const char *type;
+#if (defined (NTIER1) && defined (NTIER2)) || defined(NGLUE)
+  if (round == REDUNDANT_ROUND)
+    {
+      type = "redundant";
+      tag = 'u';
+    }
+  else
+#endif
+#ifndef NTIER2
+  if (round == REDUNDANT_TIER2_ROUND)
+    {
+      type = "redundant";
+      tag = 'u';
+    }
+  else
+#endif
+#ifndef NTIER1
+  if (round == REDUNDANT_TIER1_ROUND)
+    {
+      type = "redundant";
+      tag = 'v';
+    }
+  else
+#endif
+    {
+      assert (round == IRREDUNDANT_ROUND);
+      type = "irredundant";
+      tag = 'w';
+    }
+#else
+#if (defined (NTIER1) && defined (NTIER2)) || defined(NGLUE)
+  if (round == REDUNDANT_ROUND)
+    {
+      tag = 'u';
+    }
+  else
+#endif
+#ifndef NTIER2
+  if (round == REDUNDANT_TIER2_ROUND)
+    {
+      tag = 'u';
+    }
+  else
+#endif
+#ifndef NTIER1
+  if (round == REDUNDANT_TIER1_ROUND)
+    {
+      tag = 'v';
+    }
+  else
+#endif
+    {
+      assert (round == IRREDUNDANT_ROUND);
+      tag = 'w';
+    }
+#endif
+
+  flush_large_watches (solver);
+#ifndef NVIVIFICATIONLIMITS
+  const uint64_t scaled = effort * delta;
+  uint64_t start = solver->statistics.probing_ticks;
+  const uint64_t ticks_limit = start + scaled;
+#else
+  (void) effort;
+  (void) delta;
+  const uint64_t ticks_limit = UINT64_MAX;
+#endif
+  bool redundant, tier2;
+#if defined(NGLUE)
+  if (round == REDUNDANT_ROUND)
+    {
+      redundant = true;
+    }
+  else
+#endif
+#if (defined (NTIER1) && defined (NTIER2)) || defined(NGLUE)
+  if (round == REDUNDANT_ROUND)
+    {
+       redundant = true;
+    }
+  else
+#endif
+#ifndef NTIER1
+  if (round == REDUNDANT_TIER1_ROUND)
+    redundant = true, tier2 = false;
+  else
+#endif
+#ifndef NTIER2
+  if (round == REDUNDANT_TIER2_ROUND)
+    redundant = tier2 = true;
+  else
+#endif
+    {
+      assert (round == IRREDUNDANT_ROUND);
+      redundant = tier2 = false;
+    }
+
+  unsigned *counts = calloc (LITERALS, sizeof (unsigned));
+
+  if (!counts)
+    fatal_error ("could not allocate counts for vivification");
+  struct clauses *schedule = &solver->vivification_schedule;
+
+
+  schedule_vivification_candidates (solver, counts,
+#ifdef LOGGING
+				    type,
+#endif
+				    redundant
+#ifndef NTIER2
+				    , tier2
+#endif
+    );
+  const size_t scheduled = SIZE_STACK (*schedule);
+#ifdef LOGGING
+  const size_t total =
+    (round ==
+     IRREDUNDANT_ROUND) ? solver->statistics.irredundant : solver->statistics.
+    redundant;
+#endif
+
+  LOG ("scheduled %zu %s clauses %.0f%% of %zu", scheduled, type,
+       percent (scheduled, total), total);
+  size_t vivified = 0, tried = 0;
+
+  sort_vivification_candidates (solver, schedule, counts);
+  watch_large_clauses (solver);
+
+  while (!EMPTY_STACK (*schedule))
+    {
+      if (solver->statistics.probing_ticks > ticks_limit)
+	break;
+      struct clause *c = POP (*schedule);
+      if (c->garbage)
+	continue;
+      tried++;
+      if (vivify_clause (solver, c, counts))
+	++vivified;
+      c->vivify = false;
+      if (solver->inconsistent)
+	break;
+    }
+
+  if (solver->level)
+    backtrack (solver, 0);
+  if (!solver->inconsistent)
+    {
+      size_t remain = SIZE_STACK (*schedule);
+      const bool keep = true;
+      size_t prioritized = 0;
+      if (remain)
+	{
+	  while (!EMPTY_STACK (*schedule))
+	    {
+	      struct clause *c = POP (*schedule);
+	      if (!c->vivify)
+		continue;
+	      prioritized++;
+	      if (!keep)
+		c->vivify = false;
+	    }
+	  if (!prioritized)
+	    LOG ("no prioritized %s clauses left", type);
+	  else if (keep)
+	    LOG ("keeping %zu %s clauses prioritized %.0f%%",
+		 prioritized, type, percent (prioritized, remain));
+	}
+      else
+	LOG ("all scheduled %s clauses tried", type);
+    }
+
+  CLEAR_STACK (*schedule);
+  assert (EMPTY_STACK (solver->clause));
+
+  report (solver, 1, tag);
+  free (counts);
+  return scheduled;
+}
+
+#if (defined(NTIER1) && defined(NTIER1)) || defined(NGLUE)
+static size_t
+vivify_redundant (struct satch *solver, uint64_t delta, double effort)
+{
+  return vivify_round (solver, REDUNDANT_ROUND, delta, effort);
+}
+#endif
+#ifndef NTIER1
+static size_t
+vivify_redundant_tier1 (struct satch *solver, uint64_t delta, double effort)
+{
+  return vivify_round (solver, REDUNDANT_TIER1_ROUND, delta, effort);
+}
+#endif
+
+#ifndef NTIER2
+static size_t
+vivify_redundant_tier2 (struct satch *solver, uint64_t delta, double effort)
+{
+  return vivify_round (solver, REDUNDANT_TIER2_ROUND, delta, effort);
+}
+#endif
+
+static void
+vivify_irredundant (struct satch *solver, uint64_t redundant_scheduled,
+		    uint64_t delta, double effort)
+{
+
+  const double factor = 10;
+  const uint64_t limit = factor * redundant_scheduled;
+  uint64_t irredundant_candidates = 0;
+
+  for (all_irredundant_clauses (c))
+    {
+      assert (!c->redundant);
+      if (c->garbage)
+	continue;
+      else if (++irredundant_candidates > limit)
+	break;
+    }
+
+  if (irredundant_candidates > limit)
+    LOG ("skipping %" PRIu64 " vivify-irredundant "
+	 "candidates > limit %" PRIu64 " = %g * %" PRIu64
+	 " scheduled redundant clauses",
+	 irredundant_candidates, limit, factor, redundant_scheduled);
+  else
+    {
+      LOG ("vivify-irredundant with "
+	   "%" PRIu64 " candidates <= %" PRIu64
+	   " = %g * %" PRIu64 " scheduled redundant clauses",
+	   irredundant_candidates, limit, factor, redundant_scheduled);
+      if (irredundant_candidates > redundant_scheduled)
+	{
+	  LOG ("not sorting %" PRIu64
+	       " vivify-irredundant candidates > %" PRIu64
+	       " scheduled redundant clauses",
+	       irredundant_candidates, redundant_scheduled);
+	}
+
+      (void) vivify_round (solver, IRREDUNDANT_ROUND, delta, effort);
+    }
+}
+
+static uint64_t
+vivify_adjustment (struct satch *solver)
+{
+  return nlogn (1 + solver->statistics.irredundant +
+		solver->statistics.redundant);
+}
+
+static bool
+really_vivify (struct satch *solver)
+{
+  const uint64_t limit = vivify_adjustment (solver);
+  const uint64_t search_ticks = solver->statistics.ticks;
+  return limit < search_ticks;
+}
+
+
+
+#define MINEFFORT 1e4
+
+
+#define VIVIFYTIER1 3
+#define VIVIFYTIER2 6
+#define VIVIFYIRREDUNDANT 1
+#define VIVIFYEFFORT 100*1e-3
+
+static int
+vivify (struct satch *solver)
+{
+  if (solver->inconsistent)
+    return 20;
+
+  if (solver->level)
+    update_phases_and_backtrack_to_root_level (solver);
+  assert (!solver->level);
+  assert (!solver->dense);
+
+  const uint64_t vivifications = INC (vivifications);
+
+#ifndef NLIMITS
+  // Update vivification limit for next time
+  const uint64_t interval =
+    scale_interval (vivification_interval, nlogn, vivifications);
+  struct limits *const limits = &solver->limits;
+  limits->vivify.conflicts = CONFLICTS + interval;
+#endif
+
+  if (!solver->statistics.redundant)
+    return 0;
+  if (!really_vivify (solver))
+    return 0;
+
+  START (vivify);
+
+  solver->vivifying = true;
+
+#ifndef NVIVIFICATIONLIMITS
+  const struct statistics *const statistics = &solver->statistics;
+  const uint64_t last = statistics->ticks - limits->vivify.search;
+  const uint64_t ticks = last < MINEFFORT ? MINEFFORT : last;
+  const uint64_t adjustment = vivify_adjustment (solver);
+  const uint64_t delta = ticks * VIVIFYEFFORT + adjustment;
+#else
+  const uint64_t delta = UINT64_MAX;
+#endif
+
+  message (solver, 2, "vivification", vivifications,
+	   "elimination limit of %" PRIu64 " ticks = %g * search ticks %"
+	   PRIu64, TICKS + delta, (double) VIVIFYEFFORT, delta);
+  uint64_t redundant_scheduled = 0;
+  double sum = VIVIFYTIER1 + VIVIFYTIER2 + VIVIFYIRREDUNDANT;
+
+#ifndef NVIVIFICATIONLIMITS
+  const uint64_t vivified = solver->statistics.vivified;
+#endif
+#if (defined(NTIER1) && defined(NTIER1)) || defined(NGLUE)
+  redundant_scheduled += vivify_redundant (solver, delta, VIVIFYTIER2 / sum);
+#endif
+#ifndef NTIER2
+  redundant_scheduled +=
+    vivify_redundant_tier2 (solver, delta, VIVIFYTIER2 / sum);
+#endif
+
+
+  if (!solver->inconsistent)
+    {
+#ifndef NTIER1
+      redundant_scheduled +=
+	vivify_redundant_tier1 (solver, delta, VIVIFYTIER1 / sum);
+#endif
+
+      if (!solver->inconsistent)
+	vivify_irredundant (solver, redundant_scheduled, delta,
+			    VIVIFYIRREDUNDANT / sum);
+
+    }
+  // Finally update limits.
+
+  {
+
+#ifndef NVIVIFICATIONLIMITS
+    const uint64_t limit = limits->vivify.conflicts;
+    limits->vivify.search = TICKS;
+    message (solver, 2, "vivification", vivifications,
+	     "%" PRIu64 " vivified, next limit at %" PRIu64 " after %" PRIu64
+	     " conflicts", solver->statistics.vivified - vivified, limit,
+	     interval);
+#endif
+  }
+  assert (solver->vivifying);
+  solver->vivifying = false;
+  CLEAR_STACK (solver->vivification_schedule);
+  STOP (vivify);
+
+  if (solver->inconsistent)
+    return 20;
+  else
+    return 0;
+}
+
+static bool
+vivifying (struct satch *solver)
+{
+#ifdef NCDCL
+  if (solver->level)
+    return false;
+#endif
+#ifndef NINPROCESSING
+  return solver->limits.vivify.conflicts < CONFLICTS;
+#else
+  return !solver->statistics.vivifications;
+#endif
+}
+
+#endif // of '#ifndef NVIVIFICATION'
+
+
+#ifndef NLIMITS
 
 static void
 init_limits (struct satch *solver)
 {
+  // First initialize all limits.
+
+#ifndef NELIMINATION
+#ifndef NINPROCESSING
+  solver->limits.eliminate.conflicts = elimination_interval;
+#endif
+#endif
 #ifndef NREDUCE
   solver->limits.reduce.conflicts = reduce_interval;
 #endif
@@ -5609,17 +11631,23 @@ init_limits (struct satch *solver)
   solver->limits.mode.conflicts = initial_focused_mode_conflicts;
   solver->limits.mode.ticks.limit = initial_focused_mode_ticks;
 #endif
+
+#ifndef NVIVIFICATION
+  solver->limits.vivify.conflicts = vivification_interval;
+#endif
+  // Some sanity checking.
+
 #ifdef NSTABLE
   assert (!solver->stable);
 #endif
 #ifdef NFOCUSED
   assert (solver->stable);
 #endif
-#if defined(NRESTART) && defined(NREDUCE) && defined(NREPHASE)
-  // Avoid 'unused solver' warning with '-p'.
+
   (void) solver;
-#endif
 }
+
+#endif
 
 /*------------------------------------------------------------------------*/
 
@@ -5629,7 +11657,7 @@ static int
 solve (struct satch *solver, int delta_limit)
 {
   START (solve);
-  report (solver, '*');
+  report (solver, 1, '*');
 
   int res = solver->inconsistent ? 20 : 0;
   struct clause *conflict;
@@ -5657,6 +11685,7 @@ solve (struct satch *solver, int delta_limit)
 	  {
 	    if (CONFLICTS >= conflict_limit)
 	      break;
+	    else
 #ifndef NRESTART
 	    if (restarting (solver))
 	      restart (solver);
@@ -5675,18 +11704,27 @@ solve (struct satch *solver, int delta_limit)
 #ifndef NREPHASE
 	    if (rephasing (solver))
 	      rephase (solver);
+	    else
 #endif
-
-	    decide (solver);
+#ifndef NELIMINATION
+	    if (eliminating (solver))
+	      res = eliminate_variables (solver);
+	    else
+#endif
+#ifndef NVIVIFICATION
+	    if (vivifying (solver))
+	      res = vivify (solver);
+	    else
+#endif
+	      decide (solver);
 	  }
       }
 #ifndef NSWITCH
   stop_mode (solver);
 #endif
 
-  report (solver, !res ? '?' : res == 10 ? '1' : '0');
+  report (solver, 1, !res ? '?' : res == 10 ? '1' : '0');
   STOP (solve);
-
   return res;
 }
 
@@ -5725,6 +11763,7 @@ check_witness (struct satch *solver)
       fflush (stderr);
       abort ();
     }
+
   LOG ("checked witness successfully");
 }
 
@@ -5761,8 +11800,8 @@ do { \
 #define REQUIRE_VALID_LITERAL(ELIT) \
 do { \
   REQUIRE ((ELIT) != INT_MIN, "'INT_MIN' literal argument"); \
-  REQUIRE (sizeof (void*) > 4 || abs (ELIT) <= (1<<30), \
-           "maximum of '2^30' variables exceeded on 32-bit system"); \
+  REQUIRE (sizeof (void*) > 4 || abs (ELIT) <= (1<<29), \
+           "maximum of '2^29' variables exceeded on 32-bit system"); \
 } while (0)
 
 #define REQUIRE_NON_ZERO_VALID_LITERAL(ELIT) \
@@ -5792,6 +11831,7 @@ internal_init (void)
 #ifndef NBLOCK
   init_binary (solver);
 #endif
+
 #ifndef NVSIDS
 #ifndef NFOCUSED
   solver->scores[0].factor = focused_score_increment_factor;
@@ -5800,8 +11840,11 @@ internal_init (void)
   solver->scores[1].factor = stable_score_increment_factor;
 #endif
 #endif
+
   init_averages (solver);
+#ifndef NLIMITS
   init_limits (solver);
+#endif
   init_profiles (solver);
   return solver;
 }
@@ -5815,6 +11858,24 @@ internal_release (struct satch *solver)
   if (solver->level)
     backtrack (solver, 0);	// To delete reason clauses.
 #endif
+
+  solver->proof = 0;
+  for (all_literals (lit))
+    {
+      struct watches *watches = solver->watches + lit;
+#if !defined(NDEBUG) && !defined(NVIRTUAL)
+      const union watch *const end = watches->end;
+      for (const union watch * p = watches->begin; p != end; p++)
+	if (p->header.binary)
+	  delete_header (solver, lit, p->header);
+	else
+	  p++;
+#endif
+      RELEASE_STACK (*watches);
+    }
+
+  free (solver->watches);
+
   free (solver->levels);
   free (solver->values);
 #ifndef NSAVE
@@ -5827,10 +11888,15 @@ internal_release (struct satch *solver)
   free (solver->bests);
 #endif
   free (solver->marks);
-#ifndef NACTIVE
-  free (solver->active);
+#ifndef NVIVIFICATION
+  free (solver->vivify_marks);
 #endif
+  free (solver->flags);
   free (solver->frames);
+#ifndef NCONTROL
+  free (solver->position);
+  RELEASE_STACK (solver->control);
+#endif
   free (solver->reasons);
   free (solver->trail.begin);
 
@@ -5860,7 +11926,7 @@ internal_release (struct satch *solver)
 #endif
 #endif
 
-#ifndef NACTIVE
+#ifndef NLAZYACTIVATION
 #ifndef NFOCUSED
   RELEASE_STACK (solver->put[0]);
 #else
@@ -5873,28 +11939,24 @@ internal_release (struct satch *solver)
 #endif
 #endif
 
-  solver->proof = 0;
-  for (all_literals (lit))
-    {
-      struct watches *watches = solver->watches + lit;
-#if !defined(NDEBUG) && !defined(NVIRTUAL)
-      const union watch *const end = watches->end;
-      for (const union watch * p = watches->begin; p != end; p++)
-	if (p->header.binary)
-	  delete_header (solver, lit, p->header);
-	else
-	  p++;
+#ifndef NELIMINATION
+  RELEASE_STACK (solver->extend);
+  RELEASE_STACK (solver->resolvents);
 #endif
-      RELEASE_STACK (*watches);
-    }
-  free (solver->watches);
 
 #ifndef NMINIMIZE
-  RELEASE_STACK (solver->marked);
+  RELEASE_STACK (solver->poisoned);
+  RELEASE_STACK (solver->removable);
 #endif
-  RELEASE_STACK (solver->seen);
+#ifndef NSHRINK
+  RELEASE_STACK (solver->shrunken);
+#endif
+  RELEASE_STACK (solver->analyzed);
   RELEASE_STACK (solver->clause);
   RELEASE_STACK (solver->blocks);
+#ifndef NBINARIES
+  RELEASE_STACK (solver->binaries);
+#endif
 
   for (all_pointers_on_stack (struct clause, c, solver->irredundant))
       (void) delete_clause (solver, c);
@@ -5919,7 +11981,10 @@ internal_release (struct satch *solver)
 #endif
   checker_release (solver->checker);
 #endif
-
+#ifndef NVIVIFICATION
+  RELEASE_STACK (solver->vivification_schedule);
+  RELEASE_STACK (solver->sorted);
+#endif
   free (solver);
 }
 
@@ -5965,14 +12030,12 @@ internal_add (struct satch *solver, int elit)
 
       if (!imported_clause_trivial_or_satisfied (solver))
 	{
-#ifndef NACTIVE
 	  // Activate variables in the order they appear in the input CNF.
 	  // This gives an implicit order of the variables in the decision
 	  // queue as well as in the binary heap keeping variables in the
 	  // same clauses close to each other which seems beneficial.
 
 	  activate_literals (solver);
-#endif
 
 	  // We need special treatment for empty and unary clauses since all
 	  // internally allocated clauses have at least two literals.
@@ -6000,24 +12063,25 @@ internal_add (struct satch *solver, int elit)
 	      const signed char value = solver->values[unit];
 	      if (value > 0)
 		{
-		  LOG ("skipping redundant unit clause %u", unit);
+		  LOG ("skipping redundant unit clause %s", LOGLIT (unit));
 		}
 	      else if (value < 0)
 		{
-		  LOG ("found inconsistent unit clause %u", unit);
+		  LOG ("found inconsistent unit clause %s", LOGLIT (unit));
 		  solver->inconsistent = true;
 		}
 	      else
 		{
-		  LOG ("found unit clause %u", unit);
-		  assign (solver, unit, 0);
+		  LOG ("found unit clause %s", LOGLIT (unit));
+		  assign (solver, unit, 0, true);
+		  remove_original_clause = true;
 		}
 	    }
 #ifndef NVIRTUAL
 	  else if (size == 2)
 	    {
-	      new_binary (solver, false);
-#ifndef NDEBUG
+	      add_new_binary_and_watch_it (solver, false);
+#ifdef LOGGING
 	      const unsigned lit = ACCESS (solver->clause, 0);
 	      const unsigned other = ACCESS (solver->clause, 1);
 	      LOGBIN (false, lit, other, "imported");
@@ -6028,7 +12092,12 @@ internal_add (struct satch *solver, int elit)
 	    {
 	      struct clause *clause = new_irredundant_clause (solver);
 	      LOGCLS (clause, "imported");
+#ifndef NWATCHES
 	      watch_clause (solver, clause);
+#else
+	      connect_clause (solver, clause);
+	      count_clause (solver, clause);
+#endif
 	    }
 
 	  const size_t added = SIZE_STACK (solver->added);
@@ -6036,13 +12105,7 @@ internal_add (struct satch *solver, int elit)
 
 	  if (size < added)
 	    {
-	      if (solver->proof)
-		add_internal_clause_to_proof (solver);
-#ifndef NDEBUG
-	      for (all_elements_on_stack (unsigned, lit, solver->clause))
-		  checker_add_literal (solver->checker, export_literal (lit));
-	      checker_add_learned_clause (solver->checker);
-#endif
+	      trace_and_check_temporary_addition (solver);
 	      remove_original_clause = true;
 	    }
 	  else
@@ -6240,10 +12303,16 @@ satch_solve (struct satch *solver, int conflict_limit)
   int res = solve (solver, conflict_limit);
   LOG ("internal solving procedure returns '%d'", res);
   solver->status = res;
-#ifndef NDEBUG
   if (res == 10)
-    check_witness (solver);
+    {
+#ifndef NELIMINATION
+      extend_solution (solver);
 #endif
+
+#ifndef NDEBUG
+      check_witness (solver);
+#endif
+    }
   return res;
 }
 
@@ -6269,9 +12338,9 @@ satch_enable_logging_messages (struct satch *solver)
 #ifndef NDEBUG
   checker_logging (solver->checker);
   checker_verbose (solver->checker);
+#endif
+#ifdef LOGGING
   solver->options.logging = true;
-#else
-  (void) solver;
 #endif
   solver->options.verbose = INT_MAX;
 }

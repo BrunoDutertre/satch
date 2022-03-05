@@ -1,3 +1,27 @@
+Release 0.5.5
+-------------
+ - Fall back to DLIS when VMTF and VSIDS is off.
+ - Added NCDCL to run pure DPLL in satch (without non-chronological
+   backjumping). It uses DLIS as decision heuristic and does not
+   restart.
+ - NCHEAPPROFILING does more expansive profiling
+ - Added vivification (VIVIFICATION), with detection of implied literals
+   (NVIVIFYIMPLY)
+ - Chronological backtracking (CHRONO). You can either reuse the trail similarly
+   to restarts or always backtrack to the previous level (CHRONOREUSE)
+ - More advanced minimization criterion (see our SAT'21 paper)
+
+Release 0.5.4
+-------------
+
+- possibly counters instead of watches
+- bounded variable elimination and subsumption
+  (as first inprocessing and preprocessing algorithms)
+- learned clause shrinking (from our SAT'21 paper)
+- '-f', '-l' and '-static' configure script options
+- LOGLIT / logging_literal for more verbose literal logging
+- removed passing solver fields as arguments (was actually slower)
+
 Release 0.4.17
 --------------
 

@@ -2,9 +2,6 @@
 
 // Version extension string for disabled features.
 
-#ifdef NACTIVE
-"-active"
-#endif
 #ifdef NBEST
 "-best"
 #endif
@@ -14,11 +11,35 @@
 #ifdef NBUMP
 "-bump"
 #endif
+#ifdef NBUMPREASONS
+"-bumpreasons"
+#endif
 #ifdef NCACHE
 "-cache"
 #endif
+#ifdef NCDCL
+"-cdcl"
+#endif
+#ifdef NCHEAPPROFILING
+"-cheapprofiling"
+#endif
+#ifdef NCHRONO
+"-chrono"
+#endif
+#ifdef NCHRONOREUSE
+"-chronoreuse"
+#endif
 #ifdef NCOLOR
 "-color"
+#endif
+#ifdef NCONTROL
+"-control"
+#endif
+#ifdef NELIMINATION
+"-elimination"
+#endif
+#ifdef NELIMINATIONLIMITS
+"-eliminationlimits"
 #endif
 #ifdef NFOCUSED
 "-focused"
@@ -26,17 +47,26 @@
 #ifdef NGLUE
 "-glue"
 #endif
+#ifdef NINPROCESSING
+"-inprocessing"
+#endif
 #ifdef NINVERTED
 "-inverted"
+#endif
+#ifdef NLAZYACTIVATION
+"-lazyactivation"
 #endif
 #ifdef NLEARN
 "-learn"
 #endif
+#ifdef NLIMITS
+"-limits"
+#endif
 #ifdef NMINIMIZE
 "-minimize"
 #endif
-#ifdef NREASONS
-"-reasons"
+#ifdef NRADIXSORT
+"-radixsort"
 #endif
 #ifdef NREDUCE
 "-reduce"
@@ -50,17 +80,35 @@
 #ifdef NREUSE
 "-reuse"
 #endif
-#ifdef NRSORT
-"-rsort"
+#ifdef NREUSESTABLE
+"-reusestable"
 #endif
 #ifdef NSAVE
 "-save"
 #endif
-#ifdef NSORT
-"-sort"
+#ifdef NSHRINK
+"-shrink"
+#endif
+#ifdef NSIMPLIFICATION
+"-simplification"
+#endif
+#ifdef NSORTANALYZED
+"-sortanalyzed"
+#endif
+#ifdef NSORTDEDUCED
+"-sortdeduced"
 #endif
 #ifdef NSTABLE
 "-stable"
+#endif
+#ifdef NSTRENGTHENING
+"-strengthening"
+#endif
+#ifdef NSUBSUMPTION
+"-subsumption"
+#endif
+#ifdef NSUBSUMPTIONLIMITS
+"-subsumptionlimits"
 #endif
 #ifdef NTARGET
 "-target"
@@ -83,9 +131,21 @@
 #ifdef NVIRTUAL
 "-virtual"
 #endif
+#ifdef NVIVIFICATION
+"-vivification"
+#endif
+#ifdef NVIVIFICATIONLIMITS
+"-vivificationlimits"
+#endif
+#ifdef NVIVIFYIMPLY
+"-vivifyimply"
+#endif
 #ifdef NVMTF
 "-vmtf"
 #endif
 #ifdef NVSIDS
 "-vsids"
+#endif
+#ifdef NWATCHES
+"-watches"
 #endif
