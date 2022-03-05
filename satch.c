@@ -9988,6 +9988,8 @@ satch_fixed (struct satch *solver, unsigned lit)
   return value;
 }
 
+#if 0
+// Not used
 static inline int
 int_compare (long int a, long int b)
 {
@@ -9997,6 +9999,7 @@ int_compare (long int a, long int b)
     return 0;
   return 1;
 }
+#endif
 
 #ifdef NRADIXSORT
 
