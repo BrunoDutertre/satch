@@ -1694,7 +1694,7 @@ start_profiling (struct satch *solver, struct profile *profile)
 // Starting and stopping a profile has to follow a block structure, i.e.,
 // the corresponding 'STOP' has be to called in reverse order of 'START'.
 
-// For instance 'START (A); START (B); ...; STOP (A); STOP (B);' is correct
+// For instance 'START (A); START (B); ...; STOP (B); STOP (A);' is correct
 // but interleaving not ('START (A); START (B); ...; STOP (A); STOP (B);').
 
 // In order to simplify testing and debugging violations of this rule we
@@ -10781,7 +10781,7 @@ vivify_clause (struct satch *solver, struct clause *c, unsigned *counts)
 
   for (all_literals_in_clause (lit, c))
     {
-      const char value = satch_fixed (solver, lit);
+      const signed char value = satch_fixed (solver, lit);
       if (value < 0)
 	continue;
       if (value > 0)
@@ -10818,7 +10818,7 @@ vivify_clause (struct satch *solver, struct clause *c, unsigned *counts)
 
   for (all_literals_in_clause (lit, c))
     {
-      const char value = solver->values[lit];
+      const signed char value = solver->values[lit];
       if (value < 0)
 	continue;
       if (!value)
@@ -10872,7 +10872,7 @@ vivify_clause (struct satch *solver, struct clause *c, unsigned *counts)
 	  LOG ("forced to backtrack to decision level %u", level - 1);
 	  backtrack (solver, level - 1);
 	}
-      const char value = solver->values[lit];
+      const signed char value = solver->values[lit];
       assert (!value || levels[INDEX (lit)] <= level);
       if (!value)
 	{
